@@ -34,15 +34,18 @@
  * kernel headers a module is built against (only part of the full source).
  * Therefore, we forward-declare it again here.
  * (implicitly declared functions are an error.)
+ * Update 21-11-22: This callback has been removed in 327fe1d42b83f8a06b33ba30159582b49af5fc8e (first available in v5.3),
+ * disable this trace for now
  */
-extern void blk_mq_sched_request_inserted(struct request *rq);
+//extern void blk_mq_sched_request_inserted(struct request *rq);
+
 extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
 		struct request **merged_request);
 
 /* helper functions for getting / setting configurations via sysfs */
 ssize_t k2_max_inflight_show(struct elevator_queue *eq, char *s);
 
-ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s, 
+ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s,
                             size_t size);
 
 struct k2_data {
@@ -61,36 +64,34 @@ struct k2_data {
 
 /* configurations entries for sysfs (/sys/block/<dev>/queue/iosched/) */
 static struct elv_fs_entry k2_attrs[] = {
-    __ATTR(max_inflight, S_IRUGO | S_IWUSR, k2_max_inflight_show, 
+    __ATTR(max_inflight, S_IRUGO | S_IWUSR, k2_max_inflight_show,
                                             k2_max_inflight_set),
     __ATTR_NULL
 };
 
 
-ssize_t k2_max_inflight_show(struct elevator_queue *eq, char *s) 
+ssize_t k2_max_inflight_show(struct elevator_queue *eq, char *s)
 {
 	struct k2_data *k2d = eq->elevator_data;
 
 	return(sprintf(s, "%u\n", k2d->max_inflight));
 }
 
-ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s, 
+ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s,
                             size_t size)
 {
 
 	struct k2_data *k2d = eq->elevator_data;
-	unsigned int old_max;
 	unsigned int new_max;
 	unsigned long flags;
 
 	if (kstrtouint(s, 10, &new_max) >= 0) {
 		spin_lock_irqsave(&k2d->lock, flags);
-		old_max           = k2d->max_inflight;
 		k2d->max_inflight = new_max;
 		spin_unlock_irqrestore(&k2d->lock, flags);
-		printk(KERN_INFO "k2: max_inflight set to %u\n", 
+		printk(KERN_INFO "k2: max_inflight set to %u\n",
 			k2d->max_inflight);
-		
+
 		return(size);
 	}
 
@@ -98,7 +99,7 @@ ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s,
 	return(size);
 }
 
-static inline struct rb_root *k2_rb_root(struct k2_data *k2d, 
+static inline struct rb_root *k2_rb_root(struct k2_data *k2d,
 						struct request *rq)
 {
 	return &k2d->sort_list[rq_data_dir(rq)];
@@ -134,7 +135,7 @@ static void k2_remove_request(struct request_queue *q, struct request *r)
 }
 
 /* Initialize the scheduler. */
-static int k2_init_sched(struct request_queue *rq, struct elevator_type *et) 
+static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 {
 	struct k2_data        *k2d;
 	struct elevator_queue *eq;
@@ -143,7 +144,7 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 	eq = elevator_alloc(rq, et);
 	if (eq == NULL)
 		return(-ENOMEM);
-    
+
 	/* allocate scheduler data from mem pool of request queue */
 	k2d = kzalloc_node(sizeof(struct k2_data), GFP_KERNEL, rq->node);
 	if (k2d == NULL) {
@@ -165,39 +166,39 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 	spin_lock_init(&k2d->lock);
 
 	rq->elevator = eq;
-	printk(KERN_INFO "k2: I/O scheduler set up.\n"); 
+	printk(KERN_INFO "k2: I/O scheduler set up.\n");
 	return(0);
 }
 
 /* Leave the scheduler. */
-static void k2_exit_sched(struct elevator_queue *eq) 
+static void k2_exit_sched(struct elevator_queue *eq)
 {
 	struct k2_data *k2d = eq->elevator_data;
 
 	kfree(k2d);
 }
 
-static void k2_completed_request(struct request *r) 
+static void k2_completed_request(struct request *r, u64 watDis)
 {
 	struct k2_data *k2d = r->q->elevator->elevator_data;
 	unsigned long flags;
 	unsigned int  counter;
-	unsigned int  max_inf; 
+	unsigned int  max_inf;
 
 	spin_lock_irqsave(&k2d->lock, flags);
 	/* avoid negative counters */
 	if (k2d->inflight > 0)
 		k2d->inflight--;
 
-	/* 
-	 * Read both counters here to avoid stall situation if max_inflight  
+	/*
+	 * Read both counters here to avoid stall situation if max_inflight
 	 * is modified simultaneously.
 	 */
 	counter = k2d->inflight;
 	max_inf = k2d->max_inflight;
 	spin_unlock_irqrestore(&k2d->lock, flags);
 
-	/* 
+	/*
 	 * This completion call creates leeway for dispatching new requests.
 	 * Rerunning the hw queues have to be done manually since we throttle
 	 * request dispatching. Mind that this has to be executed in async mode.
@@ -227,7 +228,7 @@ static bool _k2_has_work(struct k2_data *k2d)
 	return(false);
 }
 
-static bool k2_has_work(struct blk_mq_hw_ctx *hctx) 
+static bool k2_has_work(struct blk_mq_hw_ctx *hctx)
 {
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
 	bool has_work;
@@ -236,13 +237,13 @@ static bool k2_has_work(struct blk_mq_hw_ctx *hctx)
 	spin_lock_irqsave(&k2d->lock, flags);
 	has_work = _k2_has_work(k2d);
 	spin_unlock_irqrestore(&k2d->lock, flags);
-    
+
 	return(has_work);
 }
 
-static void k2_ioprio_from_task(int *class, int *value) 
+static void k2_ioprio_from_task(int *class, int *value)
 {
-	if (current->io_context == NULL || 
+	if (current->io_context == NULL ||
 		!ioprio_valid(current->io_context->ioprio)) {
 		*class = task_nice_ioclass(current);
 		*value = IOPRIO_NORM;
@@ -254,7 +255,7 @@ static void k2_ioprio_from_task(int *class, int *value)
 
 /* Inserts a request into the scheduler queue. For now, at_head is ignored! */
 static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
-				bool at_head) 
+				bool at_head)
 {
 	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
@@ -283,7 +284,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 			if (!q->last_merge)
 				q->last_merge = r;
 		}
-       
+
 		if (prio_class == IOPRIO_CLASS_RT) {
 			if (prio_value >= IOPRIO_BE_NR || prio_value < 0)
 				prio_value = IOPRIO_NORM;
@@ -294,12 +295,12 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 		}
 
 		/* leave a message for tracing */
-		blk_mq_sched_request_inserted(r);
+		//blk_mq_sched_request_inserted(r);
 	}
 	spin_unlock_irqrestore(&k2d->lock, flags);
 }
 
-static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx) 
+static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 {
 	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
@@ -308,15 +309,15 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	unsigned int  i;
 
 	spin_lock_irqsave(&k2d->lock, flags);
-    
+
 	/* inflight counter may have changed since last call to has_work */
 	if (k2d->inflight >= k2d->max_inflight)
 		goto abort;
-    
+
 	/* always prefer real-time requests */
 	for (i = 0; i < IOPRIO_BE_NR; i++) {
 		if (!list_empty(&k2d->rt_reqs[i])) {
-			r = list_first_entry(&k2d->rt_reqs[i], struct request, 
+			r = list_first_entry(&k2d->rt_reqs[i], struct request,
 					     queuelist);
 			goto end;
 		}
@@ -330,7 +331,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 
 abort:
 	/* both request lists are empty or inflight counter is too high */
-	spin_unlock_irqrestore(&k2d->lock, flags);    
+	spin_unlock_irqrestore(&k2d->lock, flags);
 	return(NULL);
 
 end:
@@ -341,9 +342,8 @@ end:
 	return(r);
 }
 
-static bool k2_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio)
+static bool k2_bio_merge(struct request_queue *q, struct bio *bio, unsigned int watdis)
 {
-	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = q->elevator->elevator_data;
 	struct request *free = NULL;
 	unsigned long flags;
@@ -359,7 +359,7 @@ static bool k2_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio)
 	return(ret);
 }
 
-static int k2_request_merge(struct request_queue *q, struct request **r, 
+static int k2_request_merge(struct request_queue *q, struct request **r,
 				struct bio *bio)
 {
 	struct k2_data *k2d = q->elevator->elevator_data;
@@ -408,7 +408,7 @@ static void k2_requests_merged(struct request_queue *q, struct request *rq,
 }
 
 static struct elevator_type k2_iosched = {
-	.ops.mq = {
+	.ops = {
 		.init_sched        = k2_init_sched,
 		.exit_sched        = k2_exit_sched,
 
@@ -422,19 +422,19 @@ static struct elevator_type k2_iosched = {
 		.request_merged    = k2_request_merged,
 		.requests_merged   = k2_requests_merged,
 	},
-	.uses_mq        = true,
+    //.uses_mq        = true,
 	.elevator_attrs = k2_attrs,
 	.elevator_name  = "k2",
 	.elevator_owner = THIS_MODULE,
 };
 
-static int __init k2_init(void) 
+static int __init k2_init(void)
 {
 	printk(KERN_INFO "k2: Loading K2 I/O scheduler.\n");
 	return(elv_register(&k2_iosched));
 }
 
-static void __exit k2_exit(void) 
+static void __exit k2_exit(void)
 {
 	printk(KERN_INFO "k2: Unloading K2 I/O scheduler.\n");
 	elv_unregister(&k2_iosched);
