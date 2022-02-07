@@ -2,7 +2,7 @@
 /*
  * K2 - A prototype of a work-constraining I/O scheduler
  *
- * Copyright (c) 2019 Till Miemietz
+ * Copyright (c) 2019, Till Miemietz, 2021-2022 Georg Graßnick
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -19,6 +19,22 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
+
+/*
+ * TODO:
+ * * sysfs interface for setting queue length in us rather than inflight count
+ * * calculate request time for each access in insert_requests
+ *      * Static table for expected / benchmarked request types
+ *      * Offer adjustments for expected access time for
+ *          * reads (use random read values by default)
+ *          * writes (use random write values by default)
+ * * attach expected request time request object / if not possible, add global struct which somehow? manages access times
+ *
+ * in dispatch, check if current timing requirements can be matched
+ *      * check if expected request time is longer than what's over in the in flight time
+ * *
+ */
+
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -27,30 +43,28 @@
 #include <linux/bio.h>
 #include <linux/blk-mq.h>
 #include <linux/ioprio.h>
+#include <linux/limits.h>
 
-/*
- * blk_mq_sched_request_inserted() is EXPORT_SYMBOL_GPL'ed, but it is declared
- * in the header file block/blk-mq-sched.h, which is not part of the installed
- * kernel headers a module is built against (only part of the full source).
- * Therefore, we forward-declare it again here.
- * (implicitly declared functions are an error.)
- * Update 21-11-22: This callback has been removed in 327fe1d42b83f8a06b33ba30159582b49af5fc8e (first available in v5.3),
- * disable this trace for now
- */
-//extern void blk_mq_sched_request_inserted(struct request *rq);
+/** A type that represents the latency of a request in us */
+typedef u32 latency_us_t;
+#define LATENCY_US_T_MAX U32_MAX
+
+/** The initial value for the maximum in-flight latency */
+#define K2_MAX_INFLIGHT_USECONDS 2000
 
 extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
 		struct request **merged_request);
 
-/* helper functions for getting / setting configurations via sysfs */
-ssize_t k2_max_inflight_show(struct elevator_queue *eq, char *s);
-
-ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s,
-                            size_t size);
-
+/**
+ * @brief Global K2 data structure
+ * @details This struct is initialized by the scheduler itself exactly once.
+ *  Parallel modifications to this struct MUST ensure synchronous access provided via the k2_data::lock member
+ */
 struct k2_data {
 	unsigned int inflight;
-	unsigned int max_inflight;
+    latency_us_t current_inflight_latency;
+    latency_us_t max_inflight_latency;
+    latency_us_t lowest_upcoming_latency;
 
 	/* further group real-time requests by I/O priority */
 	struct list_head rt_reqs[IOPRIO_BE_NR];
@@ -62,42 +76,61 @@ struct k2_data {
 	spinlock_t lock;
 };
 
-/* configurations entries for sysfs (/sys/block/<dev>/queue/iosched/) */
+/* =========================
+ * ===== SYSFS RELATED =====
+ * ====================== */
+
+ssize_t k2_max_inflight_latency_show(struct elevator_queue *eq, char *s)
+{
+    struct k2_data *k2d = eq->elevator_data;
+
+    return(sprintf(s, "%u\n", k2d->max_inflight_latency));
+}
+
+ssize_t k2_max_inflight_latency_set(struct elevator_queue *eq, const char *s,
+                                    size_t size)
+{
+    struct k2_data *k2d = eq->elevator_data;
+    unsigned int new_max;
+    unsigned long flags;
+
+    if (kstrtouint(s, 10, &new_max) >= 0) {
+        spin_lock_irqsave(&k2d->lock, flags);
+        k2d->max_inflight_latency = new_max;
+        spin_unlock_irqrestore(&k2d->lock, flags);
+        printk(KERN_INFO "k2: max_inflight set to %u\n",
+               k2d->max_inflight_latency);
+
+        return(size);
+    }
+
+    /* error, leave max_inflight as is */
+    return(size);
+}
+
+ssize_t current_inflight_latency_show(struct elevator_queue *eq, char *s)
+{
+    struct k2_data *k2d = eq->elevator_data;
+    return(sprintf(s, "%u\n", k2d->current_inflight_latency));
+}
+
+ssize_t current_inflight_show(struct elevator_queue *eq, char *s)
+{
+    struct k2_data *k2d = eq->elevator_data;
+    return(sprintf(s, "%u\n", k2d->inflight));
+}
+
 static struct elv_fs_entry k2_attrs[] = {
-    __ATTR(max_inflight, S_IRUGO | S_IWUSR, k2_max_inflight_show,
-                                            k2_max_inflight_set),
+    __ATTR_RO(current_inflight),
+    __ATTR(max_inflight_latency, S_IRUGO | S_IWUSR, k2_max_inflight_latency_show,k2_max_inflight_latency_set),
+    __ATTR_RO(current_inflight_latency),
     __ATTR_NULL
 };
 
 
-ssize_t k2_max_inflight_show(struct elevator_queue *eq, char *s)
-{
-	struct k2_data *k2d = eq->elevator_data;
-
-	return(sprintf(s, "%u\n", k2d->max_inflight));
-}
-
-ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s,
-                            size_t size)
-{
-
-	struct k2_data *k2d = eq->elevator_data;
-	unsigned int new_max;
-	unsigned long flags;
-
-	if (kstrtouint(s, 10, &new_max) >= 0) {
-		spin_lock_irqsave(&k2d->lock, flags);
-		k2d->max_inflight = new_max;
-		spin_unlock_irqrestore(&k2d->lock, flags);
-		printk(KERN_INFO "k2: max_inflight set to %u\n",
-			k2d->max_inflight);
-
-		return(size);
-	}
-
-	/* error, leave max_inflight as is */
-	return(size);
-}
+/* =============================
+ * ==== K2 helper functions ====
+ * ========================== */
 
 static inline struct rb_root *k2_rb_root(struct k2_data *k2d,
 						struct request *rq)
@@ -117,24 +150,191 @@ static inline void k2_del_rq_rb(struct k2_data *k2d, struct request *rq)
 	elv_rb_del(k2_rb_root(k2d, rq), rq);
 }
 
-static void k2_remove_request(struct request_queue *q, struct request *r)
+static void k2_ioprio_from_task(int *class, int *value)
 {
-	struct k2_data *k2d = q->elevator->elevator_data;
-
-	list_del_init(&r->queuelist);
-
-	/*
-	 * During an insert merge r might have not been added to the rb-tree yet
-	 */
-	if (!RB_EMPTY_NODE(&r->rb_node))
-		k2_del_rq_rb(k2d, r);
-
-	elv_rqhash_del(q, r);
-	if (q->last_merge == r)
-		q->last_merge = NULL;
+    if (current->io_context == NULL ||
+        !ioprio_valid(current->io_context->ioprio)) {
+        *class = task_nice_ioclass(current);
+        *value = IOPRIO_NORM;
+    } else {
+        *class = IOPRIO_PRIO_CLASS(current->io_context->ioprio);
+        *value = IOPRIO_PRIO_VALUE(*class, current->io_context->ioprio);
+    }
 }
 
-/* Initialize the scheduler. */
+static bool _k2_has_work(struct k2_data *k2d)
+{
+    unsigned int  i;
+
+    assert_spin_locked(&k2d->lock);
+
+    if (k2d->max_inflight_latency - k2d->current_inflight_latency < k2d->lowest_upcoming_latency) {
+        return(false);
+    }
+
+    if (! list_empty(&k2d->be_reqs)) {
+        return (true);
+    }
+
+    for (i = 0; i < IOPRIO_BE_NR; i++) {
+        if (! list_empty(&k2d->rt_reqs[i])) {
+            return(true);
+        }
+    }
+    return(false);
+}
+
+static void k2_remove_request(struct request_queue *q, struct request *r)
+{
+    struct k2_data *k2d = q->elevator->elevator_data;
+
+    list_del_init(&r->queuelist);
+
+    /*
+     * During an insert merge r might have not been added to the rb-tree yet
+     */
+    if (!RB_EMPTY_NODE(&r->rb_node))
+        k2_del_rq_rb(k2d, r);
+
+    elv_rqhash_del(q, r);
+    if (q->last_merge == r)
+        q->last_merge = NULL;
+}
+
+/**
+ * @brief Determine the expected latency of a request
+ */
+static inline latency_us_t k2_expected_request_latency(struct request* rq)
+{
+    // For now: assume behaviour that mimics the legacy k2-8 behaviour
+    return K2_MAX_INFLIGHT_USECONDS / 8;
+}
+
+/**
+ * @brief Set the estimated latency introduced by a certain request
+ * @details For assigning additional data to each request, the kernel offers certain pointers in the request struct.
+ * Apply some magic casting and be done with it.
+ * */
+static inline void k2_set_rq_latency(struct request* rq, latency_us_t rq_lat)
+{
+    rq->elv.priv[0] = (void*)(unsigned long)rq_lat;
+}
+
+/**
+ * @brief Get the estimated latency introduced by a certain request
+ * @details For assigning additional data to each request, the kernel offers certain pointers in the request struct
+ * Apply some magic casting and be done with it.
+ * */
+static inline latency_us_t k2_get_rq_latency(struct request* rq)
+{
+    return (uintptr_t)rq->elv.priv[0];
+}
+
+/**
+ * @brief Add a request to the calculation of globally in-flight requests
+ * @details This function has to be called from a locked context, as concurrent
+ * accesses to the global struct would tamper with the result
+ * @param k2d The global k2_data struct
+ * @param rq The request to process
+ */
+static inline void k2_add_latency(struct k2_data* k2d, struct request* rq)
+{
+    unsigned int count = k2d->inflight + 1;
+    latency_us_t lat = k2d->current_inflight_latency + k2_get_rq_latency(rq);
+
+    assert_spin_locked(&k2d->lock);
+
+    printk(KERN_DEBUG "k2: Added: current inflight %u, current_latency %u \n", count, lat);
+
+    k2d->inflight = count;
+    k2d->current_inflight_latency = lat;
+}
+
+/**
+ * @brief Remove a request from the calculation of globally in-flight requests
+ * @details This function has to be called from a locked context, as concurrent
+ * accesses to the global struct would tamper with the result
+ * @param k2d The global k2_data struct
+ * @param rq The request to process
+ */
+static inline void k2_remove_latency(struct k2_data* k2d, struct request* rq)
+{
+    unsigned int count;
+    latency_us_t lat;
+
+    assert_spin_locked(&k2d->lock);
+
+    count = k2d->inflight;
+    lat = k2d->current_inflight_latency;
+
+    if (count >=1 ) {
+        count--;
+    }
+
+    if (lat > k2_get_rq_latency(rq)) {
+        lat -= k2_get_rq_latency(rq);
+    } else {
+        lat = 0;
+    }
+
+    printk(KERN_DEBUG "k2: Removed: current inflight %u, current_latency %u \n", count, lat);
+
+    k2d->inflight = count;
+    k2d->current_inflight_latency = lat;
+}
+
+/**
+ * @brief Update the lowest pending request time in the software queues
+ * @details This function has to be called from a locked context, as concurrent
+ * accesses to the global struct would tamper with the result
+ * @param k2d The global k2_data structure
+ */
+static void k2_update_lowest_pending_latency(struct k2_data* k2d)
+{
+    unsigned int i;
+    struct request* rq;
+    latency_us_t lowest_lat = LATENCY_US_T_MAX;
+    latency_us_t rq_lat;
+
+    assert_spin_locked(&k2d->lock);
+
+    // Realtime prio requests
+    for (i = 0; i < IOPRIO_BE_NR; i++) {
+        if (!list_empty(&k2d->rt_reqs[i])) {
+            rq = list_first_entry(&k2d->rt_reqs[i], struct request, queuelist);
+            rq_lat = k2_get_rq_latency(rq);
+            if (rq_lat < lowest_lat) {
+                lowest_lat = rq_lat;
+            }
+        }
+    }
+
+    // Non realtime requests
+    if (!list_empty(&k2d->be_reqs)) {
+        rq = list_first_entry(&k2d->be_reqs, struct request, queuelist);
+        rq_lat = k2_get_rq_latency(rq);
+        if (rq_lat < lowest_lat) {
+            lowest_lat = rq_lat;
+        }
+    }
+    k2d->lowest_upcoming_latency =  lowest_lat;
+}
+
+/**
+ * @brief Determine, weather a request can currently be dispatched with respect to the scheduling limitations
+ */
+static inline bool k2_does_request_fit(struct k2_data* k2d, struct request* rq)
+{
+    if (k2d->max_inflight_latency > k2d->current_inflight_latency) {
+        return k2_get_rq_latency(rq) <= k2d->max_inflight_latency - k2d->current_inflight_latency;
+    }
+    return false;
+}
+
+/* ==============================
+ * ===== ELEVATOR CALLBACKS =====
+ * ============================*/
+
 static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 {
 	struct k2_data        *k2d;
@@ -154,7 +354,9 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 	eq->elevator_data = k2d;
 
 	k2d->inflight     =  0;
-	k2d->max_inflight = 32;
+    k2d->current_inflight_latency = 0;
+    k2d->max_inflight_latency = K2_MAX_INFLIGHT_USECONDS;
+    k2d->lowest_upcoming_latency = LATENCY_US_T_MAX;
 	for (i = 0; i < IOPRIO_BE_NR; i++)
 		INIT_LIST_HEAD(&k2d->rt_reqs[i]);
 
@@ -170,62 +372,11 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 	return(0);
 }
 
-/* Leave the scheduler. */
 static void k2_exit_sched(struct elevator_queue *eq)
 {
 	struct k2_data *k2d = eq->elevator_data;
 
 	kfree(k2d);
-}
-
-static void k2_completed_request(struct request *r, u64 watDis)
-{
-	struct k2_data *k2d = r->q->elevator->elevator_data;
-	unsigned long flags;
-	unsigned int  counter;
-	unsigned int  max_inf;
-
-	spin_lock_irqsave(&k2d->lock, flags);
-	/* avoid negative counters */
-	if (k2d->inflight > 0)
-		k2d->inflight--;
-
-	/*
-	 * Read both counters here to avoid stall situation if max_inflight
-	 * is modified simultaneously.
-	 */
-	counter = k2d->inflight;
-	max_inf = k2d->max_inflight;
-	spin_unlock_irqrestore(&k2d->lock, flags);
-
-	/*
-	 * This completion call creates leeway for dispatching new requests.
-	 * Rerunning the hw queues have to be done manually since we throttle
-	 * request dispatching. Mind that this has to be executed in async mode.
-	 */
-	if (counter == (max_inf - 1))
-		blk_mq_run_hw_queues(r->q, true);
-}
-
-static bool _k2_has_work(struct k2_data *k2d)
-{
-	unsigned int  i;
-
-	assert_spin_locked(&k2d->lock);
-
-	if (k2d->inflight >= k2d->max_inflight)
-		return(false);
-
-	if (! list_empty(&k2d->be_reqs))
-		return(true);
-
-	for (i = 0; i < IOPRIO_BE_NR; i++) {
-		if (! list_empty(&k2d->rt_reqs[i])) {
-			return(true);
-		}
-	}
-
-	return(false);
 }
 
 static bool k2_has_work(struct blk_mq_hw_ctx *hctx)
@@ -241,18 +392,6 @@ static bool k2_has_work(struct blk_mq_hw_ctx *hctx)
 	return(has_work);
 }
 
-static void k2_ioprio_from_task(int *class, int *value)
-{
-	if (current->io_context == NULL ||
-		!ioprio_valid(current->io_context->ioprio)) {
-		*class = task_nice_ioclass(current);
-		*value = IOPRIO_NORM;
-	} else {
-		*class = IOPRIO_PRIO_CLASS(current->io_context->ioprio);
-		*value = IOPRIO_PRIO_VALUE(*class, current->io_context->ioprio);
-	}
-}
-
 /* Inserts a request into the scheduler queue. For now, at_head is ignored! */
 static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
 				bool at_head)
@@ -260,6 +399,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
 	unsigned long flags;
+    latency_us_t rq_lat;
 
 	spin_lock_irqsave(&k2d->lock, flags);
 	while (!list_empty(rqs)) {
@@ -285,6 +425,9 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 				q->last_merge = r;
 		}
 
+        rq_lat = k2_expected_request_latency(r);
+        k2_set_rq_latency(r, rq_lat);
+
 		if (prio_class == IOPRIO_CLASS_RT) {
 			if (prio_value >= IOPRIO_BE_NR || prio_value < 0)
 				prio_value = IOPRIO_NORM;
@@ -294,8 +437,8 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 			list_add_tail(&r->queuelist, &k2d->be_reqs);
 		}
 
-		/* leave a message for tracing */
-		//blk_mq_sched_request_inserted(r);
+        // TODO: Inline this functionality to the iterations already done in this function
+        k2_update_lowest_pending_latency(k2d);
 	}
 	spin_unlock_irqrestore(&k2d->lock, flags);
 }
@@ -304,42 +447,53 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 {
 	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
-	struct request *r;
+    struct request *rq;
 	unsigned long flags;
 	unsigned int  i;
 
 	spin_lock_irqsave(&k2d->lock, flags);
 
 	/* inflight counter may have changed since last call to has_work */
-	if (k2d->inflight >= k2d->max_inflight)
+	if (k2d->current_inflight_latency >= k2d->max_inflight_latency)
 		goto abort;
 
 	/* always prefer real-time requests */
 	for (i = 0; i < IOPRIO_BE_NR; i++) {
 		if (!list_empty(&k2d->rt_reqs[i])) {
-			r = list_first_entry(&k2d->rt_reqs[i], struct request,
-					     queuelist);
-			goto end;
+            rq = list_first_entry(&k2d->rt_reqs[i], struct request, queuelist);
+            if (k2_does_request_fit(k2d, rq)) {
+                goto end;
+            }
+
 		}
 	}
 
 	/* no rt rqs waiting: choose other workload */
 	if (!list_empty(&k2d->be_reqs)) {
-		r = list_first_entry(&k2d->be_reqs, struct request, queuelist);
-		goto end;
+        rq = list_first_entry(&k2d->be_reqs, struct request, queuelist);
+        if (k2_does_request_fit(k2d, rq)) {
+            goto end;
+        }
 	}
+
+    goto abort;
 
 abort:
 	/* both request lists are empty or inflight counter is too high */
 	spin_unlock_irqrestore(&k2d->lock, flags);
+
 	return(NULL);
 
 end:
-	k2_remove_request(q, r);
-	k2d->inflight++;
-	r->rq_flags |= RQF_STARTED;
+	k2_remove_request(q, rq);
+    k2_add_latency(k2d, rq);
+    rq->rq_flags |= RQF_STARTED;
+    // TODO: Inline this functionality to the iterations already done in this function
+    k2_update_lowest_pending_latency(k2d);
+
 	spin_unlock_irqrestore(&k2d->lock, flags);
-	return(r);
+
+	return(rq);
 }
 
 static bool k2_bio_merge(struct request_queue *q, struct bio *bio, unsigned int watdis)
@@ -348,6 +502,8 @@ static bool k2_bio_merge(struct request_queue *q, struct bio *bio, unsigned int 
 	struct request *free = NULL;
 	unsigned long flags;
 	bool ret;
+
+    printk(KERN_INFO "k2: Entering k2_bio_merge.\n");
 
 	spin_lock_irqsave(&k2d->lock, flags);
 	ret = blk_mq_sched_try_merge(q, bio, &free);
@@ -359,13 +515,14 @@ static bool k2_bio_merge(struct request_queue *q, struct bio *bio, unsigned int 
 	return(ret);
 }
 
-static int k2_request_merge(struct request_queue *q, struct request **r,
+static int k2_request_merge(struct request_queue *q, struct request **rq,
 				struct bio *bio)
 {
 	struct k2_data *k2d = q->elevator->elevator_data;
 	struct request *__rq;
 	sector_t sector = bio_end_sector(bio);
 
+    printk(KERN_INFO "k2: Entering k2_request_merge.\n");
 	assert_spin_locked(&k2d->lock);
 
 	// should request merging cross I/O prios?
@@ -375,7 +532,7 @@ static int k2_request_merge(struct request_queue *q, struct request **r,
 		BUG_ON(sector != blk_rq_pos(__rq));
 
 		if (elv_bio_merge_ok(__rq, bio)) {
-			*r = __rq;
+			*rq = __rq;
 			return(ELEVATOR_FRONT_MERGE);
 		}
 	}
@@ -383,17 +540,19 @@ static int k2_request_merge(struct request_queue *q, struct request **r,
 	return(ELEVATOR_NO_MERGE);
 }
 
-static void k2_request_merged(struct request_queue *q, struct request *req,
+static void k2_request_merged(struct request_queue *q, struct request *rq,
 				enum elv_merge type)
 {
 	struct k2_data *k2d = q->elevator->elevator_data;
+
+    printk(KERN_INFO "k2: Entering k2_request_merged.\n");
 
 	/*
 	 * if the merge was a front merge, we need to reposition request
 	 */
 	if (type == ELEVATOR_FRONT_MERGE) {
-		k2_del_rq_rb(k2d, req);
-		k2_add_rq_rb(k2d, req);
+		k2_del_rq_rb(k2d, rq);
+		k2_add_rq_rb(k2d, rq);
 	}
 }
 
@@ -404,7 +563,51 @@ static void k2_request_merged(struct request_queue *q, struct request *req,
 static void k2_requests_merged(struct request_queue *q, struct request *rq,
 				struct request *next)
 {
+    struct k2_data *k2d = rq->q->elevator->elevator_data;
+    unsigned long flags;
+
+    printk(KERN_INFO "k2: Entering k2_requests_merged.\n");
+
+    spin_lock_irqsave(&k2d->lock, flags);
+    // TODO: How to handle inflight latency here? Is it necessary?
+
 	k2_remove_request(q, next);
+    k2_set_rq_latency(rq, k2_expected_request_latency(rq));
+    k2_update_lowest_pending_latency(k2d);
+
+    spin_unlock_irqrestore(&k2d->lock, flags);
+}
+
+static void k2_completed_request(struct request *rq, u64 watDis)
+{
+    struct k2_data *k2d = rq->q->elevator->elevator_data;
+    unsigned long flags;
+    latency_us_t current_lat;
+    latency_us_t max_lat;
+    latency_us_t lowest_upcoming_lat;
+
+    spin_lock_irqsave(&k2d->lock, flags);
+
+    k2_remove_latency(k2d, rq);
+
+    /*
+     * Read both counters here to avoid stall situation if max_inflight
+     * is modified simultaneously.
+     */
+    current_lat = k2d->current_inflight_latency;
+    max_lat = k2d->max_inflight_latency;
+    lowest_upcoming_lat = k2d->lowest_upcoming_latency;
+
+    spin_unlock_irqrestore(&k2d->lock, flags);
+
+    /*
+    * This completion call creates leeway for dispatching new requests.
+    * Rerunning the hw queues have to be done manually since we throttle
+    * request dispatching. Mind that this has to be executed in async mode.
+    */
+    if (current_lat < max_lat && max_lat - current_lat >= lowest_upcoming_lat) {
+        blk_mq_run_hw_queues(rq->q, true);
+    }
 }
 
 static struct elevator_type k2_iosched = {
@@ -417,16 +620,20 @@ static struct elevator_type k2_iosched = {
 		.dispatch_request  = k2_dispatch_request,
 		.completed_request = k2_completed_request,
 
-		.bio_merge         = k2_bio_merge,
+        .bio_merge         = k2_bio_merge,
 		.request_merge     = k2_request_merge,
 		.request_merged    = k2_request_merged,
 		.requests_merged   = k2_requests_merged,
 	},
-    //.uses_mq        = true,
 	.elevator_attrs = k2_attrs,
 	.elevator_name  = "k2",
 	.elevator_owner = THIS_MODULE,
 };
+
+
+/* =============================
+ * ==== MODULE REGISTRATION ====
+ * ========================== */
 
 static int __init k2_init(void)
 {
@@ -444,6 +651,6 @@ module_init(k2_init);
 module_exit(k2_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Till Miemietz");
+MODULE_AUTHOR("Till Miemietz, Georg Grassnick");
 MODULE_DESCRIPTION("A work-constraining I/O scheduler with real-time notion.");
 MODULE_VERSION("0.1");
