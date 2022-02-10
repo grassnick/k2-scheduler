@@ -29,6 +29,7 @@
  *          * reads (use random read values by default)
  *          * writes (use random write values by default)
  * * attach expected request time request object / if not possible, add global struct which somehow? manages access times
+ * * Do not block if there are currently no inflight requests -> avoid stalling queue if all remaining elements are expected to exceed queue limit
  *
  * in dispatch, check if current timing requirements can be matched
  *      * check if expected request time is longer than what's over in the in flight time
@@ -45,12 +46,32 @@
 #include <linux/ioprio.h>
 #include <linux/limits.h>
 
+/** Macro to disable Kernel massages meant for debugging */
+#define K2_LOG(log) log
+
 /** A type that represents the latency of a request in us */
 typedef u32 latency_us_t;
 #define LATENCY_US_T_MAX U32_MAX
 
 /** The initial value for the maximum in-flight latency */
-#define K2_MAX_INFLIGHT_USECONDS 2000
+#define K2_MAX_INFLIGHT_USECONDS 10000000
+
+#define K2_RR_4K_LAT   54365
+#define K2_RR_8K_LAT   64170
+#define K2_RR_16K_LAT  56925
+#define K2_RR_64K_LAT  93675
+#define K2_RR_512K_LAT 241110
+
+#define K2_RW_4K_LAT   56890
+#define K2_RW_8K_LAT   76225
+#define K2_RW_16K_LAT  76715
+#define K2_RW_64K_LAT  82640
+#define K2_RW_512K_LAT 239385
+
+#define K2_4K 4 << 10
+#define K2_64K 64 << 10
+#define K2_512K 512 << 10
+
 
 extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
 		struct request **merged_request);
@@ -65,6 +86,21 @@ struct k2_data {
     latency_us_t current_inflight_latency;
     latency_us_t max_inflight_latency;
     latency_us_t lowest_upcoming_latency;
+
+    /* Expected latencies for typical access sizes */
+    /* Random Read */
+    latency_us_t rr_4K_lat;
+    latency_us_t rr_8K_lat;
+    latency_us_t rr_16K_lat;
+    latency_us_t rr_64K_lat;
+    latency_us_t rr_512K_lat;
+
+    /* Random Write */
+    latency_us_t rw_4K_lat;
+    latency_us_t rw_8K_lat;
+    latency_us_t rw_16K_lat;
+    latency_us_t rw_64K_lat;
+    latency_us_t rw_512K_lat;
 
 	/* further group real-time requests by I/O priority */
 	struct list_head rt_reqs[IOPRIO_BE_NR];
@@ -204,9 +240,38 @@ static void k2_remove_request(struct request_queue *q, struct request *r)
 /**
  * @brief Determine the expected latency of a request
  */
-static inline latency_us_t k2_expected_request_latency(struct request* rq)
+static latency_us_t k2_expected_request_latency(struct k2_data* k2d, struct request* rq)
 {
     // For now: assume behaviour that mimics the legacy k2-8 behaviour
+    unsigned int rq_size = blk_rq_bytes(rq);
+    latency_us_t rq_lat = 0;
+    K2_LOG(printk(KERN_INFO "k2: Request size: %u", rq_size));
+    //unsigned int rq_sectors = blk_rq_sectors(rq);
+
+    switch (rq->cmd_flags & REQ_OP_MASK) {
+        case REQ_OP_READ:
+            K2_LOG(printk(KERN_INFO "k2: Request is read"));
+            if(rq_size == K2_4K) {
+                rq_lat = k2d->rr_4K_lat;
+            } else if (rq_size == K2_64K) {
+                rq_lat = k2d->rr_64K_lat;
+            }
+            break;
+        case REQ_OP_WRITE:
+            K2_LOG(printk(KERN_INFO "k2: Request is write"));
+            if(rq_size == K2_4K) {
+                rq_lat = k2d->rw_4K_lat;
+            } else if (rq_size == K2_64K) {
+                rq_lat = k2d->rw_64K_lat;
+            }
+            break;
+        default:
+            K2_LOG(printk(KERN_INFO "k2: Request is misc: %u", rq->cmd_flags & REQ_OP_MASK));
+    }
+    K2_LOG(printk(KERN_INFO "k2: Expected introduced latency: %u", rq_lat));
+    return rq_lat;
+
+    legacy:
     return K2_MAX_INFLIGHT_USECONDS / 8;
 }
 
@@ -244,7 +309,7 @@ static inline void k2_add_latency(struct k2_data* k2d, struct request* rq)
 
     assert_spin_locked(&k2d->lock);
 
-    printk(KERN_DEBUG "k2: Added: current inflight %u, current_latency %u \n", count, lat);
+    K2_LOG(printk(KERN_DEBUG "k2: Added: current inflight %u, current_latency %u", count, lat));
 
     k2d->inflight = count;
     k2d->current_inflight_latency = lat;
@@ -277,7 +342,7 @@ static inline void k2_remove_latency(struct k2_data* k2d, struct request* rq)
         lat = 0;
     }
 
-    printk(KERN_DEBUG "k2: Removed: current inflight %u, current_latency %u \n", count, lat);
+    K2_LOG(printk(KERN_DEBUG "k2: Removed: current inflight %u, current_latency %u", count, lat));
 
     k2d->inflight = count;
     k2d->current_inflight_latency = lat;
@@ -365,6 +430,18 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 	k2d->sort_list[READ] = RB_ROOT;
 	k2d->sort_list[WRITE] = RB_ROOT;
 
+    k2d->rr_4K_lat = K2_RR_4K_LAT;
+    k2d->rr_8K_lat = K2_RR_8K_LAT;
+    k2d->rr_16K_lat = K2_RR_16K_LAT;
+    k2d->rr_64K_lat = K2_RR_64K_LAT;
+    k2d->rr_512K_lat = K2_RR_512K_LAT;
+
+    k2d->rw_4K_lat = K2_RW_4K_LAT;
+    k2d->rw_8K_lat = K2_RW_8K_LAT;
+    k2d->rw_16K_lat = K2_RW_16K_LAT;
+    k2d->rw_64K_lat = K2_RW_64K_LAT;
+    k2d->rw_512K_lat = K2_RW_512K_LAT;
+
 	spin_lock_init(&k2d->lock);
 
 	rq->elevator = eq;
@@ -425,7 +502,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 				q->last_merge = r;
 		}
 
-        rq_lat = k2_expected_request_latency(r);
+        rq_lat = k2_expected_request_latency(k2d, r);
         k2_set_rq_latency(r, rq_lat);
 
 		if (prio_class == IOPRIO_CLASS_RT) {
@@ -503,7 +580,7 @@ static bool k2_bio_merge(struct request_queue *q, struct bio *bio, unsigned int 
 	unsigned long flags;
 	bool ret;
 
-    printk(KERN_INFO "k2: Entering k2_bio_merge.\n");
+    K2_LOG(printk(KERN_INFO "k2: Entering k2_bio_merge"));
 
 	spin_lock_irqsave(&k2d->lock, flags);
 	ret = blk_mq_sched_try_merge(q, bio, &free);
@@ -522,7 +599,7 @@ static int k2_request_merge(struct request_queue *q, struct request **rq,
 	struct request *__rq;
 	sector_t sector = bio_end_sector(bio);
 
-    printk(KERN_INFO "k2: Entering k2_request_merge.\n");
+    K2_LOG(printk(KERN_INFO "k2: Entering k2_request_merge"));
 	assert_spin_locked(&k2d->lock);
 
 	// should request merging cross I/O prios?
@@ -545,7 +622,7 @@ static void k2_request_merged(struct request_queue *q, struct request *rq,
 {
 	struct k2_data *k2d = q->elevator->elevator_data;
 
-    printk(KERN_INFO "k2: Entering k2_request_merged.\n");
+    K2_LOG(printk(KERN_INFO "k2: Entering k2_request_merged"));
 
 	/*
 	 * if the merge was a front merge, we need to reposition request
@@ -566,13 +643,14 @@ static void k2_requests_merged(struct request_queue *q, struct request *rq,
     struct k2_data *k2d = rq->q->elevator->elevator_data;
     unsigned long flags;
 
-    printk(KERN_INFO "k2: Entering k2_requests_merged.\n");
+    K2_LOG(printk(KERN_INFO "k2: Entering k2_requests_merged"));
+
 
     spin_lock_irqsave(&k2d->lock, flags);
     // TODO: How to handle inflight latency here? Is it necessary?
 
 	k2_remove_request(q, next);
-    k2_set_rq_latency(rq, k2_expected_request_latency(rq));
+    k2_set_rq_latency(rq, k2_expected_request_latency(k2d, rq));
     k2_update_lowest_pending_latency(k2d);
 
     spin_unlock_irqrestore(&k2d->lock, flags);
@@ -597,6 +675,8 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     current_lat = k2d->current_inflight_latency;
     max_lat = k2d->max_inflight_latency;
     lowest_upcoming_lat = k2d->lowest_upcoming_latency;
+
+
 
     spin_unlock_irqrestore(&k2d->lock, flags);
 
