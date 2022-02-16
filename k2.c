@@ -47,14 +47,14 @@
 #include <linux/limits.h>
 
 /** Macro to disable Kernel massages meant for debugging */
-#define K2_LOG(log) log
+#define K2_LOG(log)
 
 /** A type that represents the latency of a request in us */
 typedef u32 latency_us_t;
 #define LATENCY_US_T_MAX U32_MAX
 
 /** The initial value for the maximum in-flight latency */
-#define K2_MAX_INFLIGHT_USECONDS 10000000
+#define K2_MAX_INFLIGHT_USECONDS 54365 * 4
 
 #define K2_RR_4K_LAT   54365
 #define K2_RR_8K_LAT   64170
@@ -204,7 +204,7 @@ static bool _k2_has_work(struct k2_data *k2d)
 
     assert_spin_locked(&k2d->lock);
 
-    if (k2d->max_inflight_latency - k2d->current_inflight_latency < k2d->lowest_upcoming_latency) {
+    if (k2d->max_inflight_latency - k2d->current_inflight_latency < k2d->lowest_upcoming_latency && k2d->inflight > 0) {
         return(false);
     }
 
@@ -388,12 +388,29 @@ static void k2_update_lowest_pending_latency(struct k2_data* k2d)
 /**
  * @brief Determine, weather a request can currently be dispatched with respect to the scheduling limitations
  */
-static inline bool k2_does_request_fit(struct k2_data* k2d, struct request* rq)
-{
-    if (k2d->max_inflight_latency > k2d->current_inflight_latency) {
-        return k2_get_rq_latency(rq) <= k2d->max_inflight_latency - k2d->current_inflight_latency;
+static inline bool k2_does_request_fit(struct k2_data* k2d, struct request* rq) {
+    bool does_fit;
+
+    // Do not deadlock when request time exceeds maximum inflight latency
+    if (k2d->inflight == 0) {
+        K2_LOG(printk(KERN_INFO "k2: Queue is empty, Request dispatch accepted!"));
+        return true;
     }
-    return false;
+
+    if (k2d->max_inflight_latency > k2d->current_inflight_latency) {
+        does_fit = k2_get_rq_latency(rq) <= k2d->max_inflight_latency - k2d->current_inflight_latency;
+    } else {
+        // Queue limit already exceeded
+        does_fit = false;
+    }
+
+    if (!does_fit) {
+        K2_LOG(printk(KERN_INFO "k2: Request dispatch rejected, queue limit would be exceeded!"));
+    } else {
+        K2_LOG(printk(KERN_INFO "k2: Request dispatch accepted!"));
+    }
+
+    return does_fit;
 }
 
 /* ==============================
