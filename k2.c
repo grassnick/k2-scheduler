@@ -54,23 +54,19 @@ typedef u32 latency_us_t;
 #define LATENCY_US_T_MAX U32_MAX
 
 /** The initial value for the maximum in-flight latency */
-#define K2_MAX_INFLIGHT_USECONDS 54365 * 4
+#define K2_MAX_INFLIGHT_USECONDS 62490 * 4
 
-#define K2_RR_4K_LAT   54365
-#define K2_RR_8K_LAT   64170
-#define K2_RR_16K_LAT  56925
-#define K2_RR_64K_LAT  93675
-#define K2_RR_512K_LAT 241110
+#define K2_RR_512_LAT   61570
+#define K2_RR_32K_LAT   70905
+#define K2_RR_2048K_LAT 686210
 
-#define K2_RW_4K_LAT   56890
-#define K2_RW_8K_LAT   76225
-#define K2_RW_16K_LAT  76715
-#define K2_RW_64K_LAT  82640
-#define K2_RW_512K_LAT 239385
+#define K2_RW_512_LAT   68285
+#define K2_RW_32K_LAT   76260
+#define K2_RW_2048K_LAT 707430
 
-#define K2_4K 4 << 10
-#define K2_64K 64 << 10
-#define K2_512K 512 << 10
+#define K2_512 512
+#define K2_32K 32 << 10
+#define K2_2048K 2 << 20
 
 
 extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
@@ -89,18 +85,14 @@ struct k2_data {
 
     /* Expected latencies for typical access sizes */
     /* Random Read */
-    latency_us_t rr_4K_lat;
-    latency_us_t rr_8K_lat;
-    latency_us_t rr_16K_lat;
-    latency_us_t rr_64K_lat;
-    latency_us_t rr_512K_lat;
+    latency_us_t rr_512_lat;
+    latency_us_t rr_32K_lat;
+    latency_us_t rr_2048K_lat;
 
     /* Random Write */
-    latency_us_t rw_4K_lat;
-    latency_us_t rw_8K_lat;
-    latency_us_t rw_16K_lat;
-    latency_us_t rw_64K_lat;
-    latency_us_t rw_512K_lat;
+    latency_us_t rw_512_lat;
+    latency_us_t rw_32K_lat;
+    latency_us_t rw_2048K_lat;
 
 	/* further group real-time requests by I/O priority */
 	struct list_head rt_reqs[IOPRIO_BE_NR];
@@ -237,32 +229,54 @@ static void k2_remove_request(struct request_queue *q, struct request *r)
         q->last_merge = NULL;
 }
 
+static latency_us_t k2_linear_interpolation(const u32 val
+        , const u32 lower_val, const u32 upper_val
+        , const latency_us_t lower_lat, const latency_us_t upper_lat)
+{
+    const u32 diff_val = upper_val - lower_val;
+    const u32 diff_lat = upper_lat - lower_lat;
+    const u32 offset_val = val - lower_val;
+    const u32 value_percentage = 100 * offset_val / diff_val;
+    return lower_lat + diff_lat * value_percentage / 100;
+
+}
+
 /**
  * @brief Determine the expected latency of a request
  */
 static latency_us_t k2_expected_request_latency(struct k2_data* k2d, struct request* rq)
 {
-    // For now: assume behaviour that mimics the legacy k2-8 behaviour
-    unsigned int rq_size = blk_rq_bytes(rq);
-    latency_us_t rq_lat = 0;
-    K2_LOG(printk(KERN_INFO "k2: Request size: %u", rq_size));
+    const unsigned int rq_size = blk_rq_bytes(rq);
     //unsigned int rq_sectors = blk_rq_sectors(rq);
+
+    // Requests that are neither write nor read are not taken into account
+    latency_us_t rq_lat = 0;
+
+    K2_LOG(printk(KERN_INFO "k2: Request size: %u (%uk)", rq_size, rq_size / 1024));
 
     switch (rq->cmd_flags & REQ_OP_MASK) {
         case REQ_OP_READ:
             K2_LOG(printk(KERN_INFO "k2: Request is read"));
-            if(rq_size == K2_4K) {
-                rq_lat = k2d->rr_4K_lat;
-            } else if (rq_size == K2_64K) {
-                rq_lat = k2d->rr_64K_lat;
+            if(rq_size <= K2_512) {
+                rq_lat = k2d->rr_512_lat;
+            } else if (rq_size <= K2_32K) {
+                rq_lat = k2_linear_interpolation(rq_size, K2_512, K2_32K, k2d->rr_512_lat, k2d->rr_32K_lat);
+            } else if (rq_size < K2_2048K) {
+                rq_lat = k2_linear_interpolation(rq_size, K2_32K, K2_2048K, k2d->rr_32K_lat, k2d->rr_2048K_lat);
+            } else {
+                rq_lat = k2d->rr_2048K_lat;
             }
             break;
         case REQ_OP_WRITE:
             K2_LOG(printk(KERN_INFO "k2: Request is write"));
-            if(rq_size == K2_4K) {
-                rq_lat = k2d->rw_4K_lat;
-            } else if (rq_size == K2_64K) {
-                rq_lat = k2d->rw_64K_lat;
+            if(rq_size <= K2_512) {
+                rq_lat = k2d->rw_512_lat;
+            } else if (rq_size <= K2_32K) {
+                rq_lat = k2_linear_interpolation(rq_size, K2_512, K2_32K, k2d->rw_512_lat, k2d->rw_32K_lat);
+            } else if (rq_size < K2_2048K) {
+                rq_lat = k2_linear_interpolation(rq_size, K2_32K, K2_2048K, k2d->rw_32K_lat, k2d->rw_2048K_lat);
+            } else {
+                rq_lat = k2d->rw_2048K_lat;
             }
             break;
         default:
@@ -272,6 +286,7 @@ static latency_us_t k2_expected_request_latency(struct k2_data* k2d, struct requ
     return rq_lat;
 
     legacy:
+    // Assume behaviour that mimics the legacy k2-8 behaviour
     return K2_MAX_INFLIGHT_USECONDS / 8;
 }
 
@@ -447,17 +462,13 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 	k2d->sort_list[READ] = RB_ROOT;
 	k2d->sort_list[WRITE] = RB_ROOT;
 
-    k2d->rr_4K_lat = K2_RR_4K_LAT;
-    k2d->rr_8K_lat = K2_RR_8K_LAT;
-    k2d->rr_16K_lat = K2_RR_16K_LAT;
-    k2d->rr_64K_lat = K2_RR_64K_LAT;
-    k2d->rr_512K_lat = K2_RR_512K_LAT;
+    k2d->rr_512_lat = K2_RR_512_LAT;
+    k2d->rr_32K_lat = K2_RR_32K_LAT;
+    k2d->rr_2048K_lat = K2_RR_2048K_LAT;
 
-    k2d->rw_4K_lat = K2_RW_4K_LAT;
-    k2d->rw_8K_lat = K2_RW_8K_LAT;
-    k2d->rw_16K_lat = K2_RW_16K_LAT;
-    k2d->rw_64K_lat = K2_RW_64K_LAT;
-    k2d->rw_512K_lat = K2_RW_512K_LAT;
+    k2d->rw_512_lat = K2_RW_512_LAT;
+    k2d->rw_32K_lat = K2_RW_32K_LAT;
+    k2d->rw_2048K_lat = K2_RW_2048K_LAT;
 
 	spin_lock_init(&k2d->lock);
 
