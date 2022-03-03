@@ -697,7 +697,9 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     latency_us_t current_lat;
     latency_us_t max_lat;
     latency_us_t lowest_upcoming_lat;
-    trace_k2_completed_request(rq);
+    u64 real_latency = ktime_get_ns() - rq->io_start_time_ns;
+
+    trace_k2_completed_request(rq, real_latency);
 
     spin_lock_irqsave(&k2d->lock, flags);
 
