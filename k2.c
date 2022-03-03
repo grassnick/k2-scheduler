@@ -35,6 +35,7 @@
  *      * check if expected request time is longer than what's over in the in flight time
  * *
  */
+#include <trace/events/block.h>
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -45,6 +46,10 @@
 #include <linux/blk-mq.h>
 #include <linux/ioprio.h>
 #include <linux/limits.h>
+
+#define CREATE_TRACE_POINTS
+#include "k2_trace.h"
+EXPORT_TRACEPOINT_SYMBOL_GPL(k2_completed_request);
 
 /** Macro to disable Kernel massages meant for debugging */
 #define K2_LOG(log)
@@ -298,6 +303,7 @@ static latency_us_t k2_expected_request_latency(struct k2_data* k2d, struct requ
 static inline void k2_set_rq_latency(struct request* rq, latency_us_t rq_lat)
 {
     rq->elv.priv[0] = (void*)(unsigned long)rq_lat;
+    rq->elv.priv[1] = (void*)(unsigned long)blk_rq_bytes(rq);
 }
 
 /**
@@ -691,6 +697,7 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     latency_us_t current_lat;
     latency_us_t max_lat;
     latency_us_t lowest_upcoming_lat;
+    trace_k2_completed_request(rq);
 
     spin_lock_irqsave(&k2d->lock, flags);
 
