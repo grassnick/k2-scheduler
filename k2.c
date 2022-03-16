@@ -284,6 +284,7 @@ static void k2_close_dev(void) {
         kfree(global_k2_dev);
     }
     global_k2_dev = NULL;
+    printk(KERN_INFO "k2: Unregistered device node: /dev/%s", K2_DEVICE_NAME);
 }
 
 static int k2_init_dev(void) {
