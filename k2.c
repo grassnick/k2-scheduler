@@ -37,19 +37,30 @@
  */
 #include <trace/events/block.h>
 
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/blkdev.h>
-#include <linux/elevator.h>
 #include <linux/bio.h>
 #include <linux/blk-mq.h>
+#include <linux/blkdev.h>
+#include <linux/cdev.h>
+#include <linux/elevator.h>
+#include <linux/fs.h>
+#include <linux/init.h>
+#include <linux/ioctl.h>
 #include <linux/ioprio.h>
+#include <linux/kernel.h>
 #include <linux/limits.h>
+#include <linux/miscdevice.h>
+#include <linux/module.h>
+#include <linux/uaccess.h>
 
 #define CREATE_TRACE_POINTS
+
+// Tracing related
 #include "k2_trace.h"
+
 EXPORT_TRACEPOINT_SYMBOL_GPL(k2_completed_request);
+
+// Device and ioctl related
+#include "k2.h"
 
 /** Macro to disable Kernel massages meant for debugging */
 #define K2_LOG(log)
@@ -73,6 +84,7 @@ typedef u32 latency_us_t;
 #define K2_32K 32 << 10
 #define K2_2048K 2 << 20
 
+static unsigned long k2_version = 100;
 
 extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
 		struct request **merged_request);
@@ -157,9 +169,182 @@ static struct elv_fs_entry k2_attrs[] = {
     __ATTR_RO(current_inflight),
     __ATTR(max_inflight_latency, S_IRUGO | S_IWUSR, k2_max_inflight_latency_show,k2_max_inflight_latency_set),
     __ATTR_RO(current_inflight_latency),
-    __ATTR_NULL
+    __ATTR_NULL};
+
+
+/* ===============
+ * ==== IOCTL ====
+ * ============ */
+
+/**
+ * @See https://static.lwn.net/images/pdf/LDD3/ch03.pdf
+ */
+#define K2_DEVICE_NAME "k2-iosched"
+#define K2_NUMBER_DEVICES 1
+
+struct k2_dev {
+    struct cdev cdev;
+    struct device *device;
 };
 
+/**
+ * @brief Global device pointer for ioctl interaction
+ * @details Always check for NULL, make sure to deallocate on module cleanup
+ */
+static struct k2_dev *global_k2_dev = NULL;
+
+
+static int k2_dev_open(struct inode *inode, struct file *filp) { return 0; }
+
+static int k2_dev_release(struct inode *inode, struct file *filp) { return 0; }
+
+/**
+ * @brief Entry point for ioctl requests
+ */
+static long k2_dev_ioctl(struct file *file, unsigned int cmd,
+                         unsigned long arg) {
+    // struct inode *inode = file_inode(file);
+
+    void __user *argp = (void __user *) arg;
+    struct k2_ioctl ioctl;
+    unsigned long ret = 0;
+    __u32 test = 1337;
+    char dev[64];
+
+    switch (cmd) {
+        case K2_IOC_GET_VERSION:
+            ret = copy_to_user(argp, &k2_version, sizeof(k2_version));
+            break;
+        case K2_IOC_CURRENT_INFLIGHT_LATENCY:
+            printk(KERN_INFO "k2: received READ WRITE TEST IOCTL\n");
+            ret = copy_from_user(&ioctl, argp, sizeof(struct k2_ioctl));
+            if (ret) {
+                break;
+            }
+            ret = copy_from_user(dev, ioctl.dev_name, 64);
+            if (ret) {
+                break;
+            }
+            printk(KERN_INFO "k2: received READ CURRENT INFLIGHT LATENCY REQUEST for device %s\n", dev);
+            ioctl.u32_ret = K2_MAX_INFLIGHT_USECONDS;
+            ret = copy_to_user(argp, &ioctl, sizeof(struct k2_ioctl));
+            break;
+        case K2_IOC_READ_TEST:
+            printk(KERN_INFO "k2: received READ TEST IOCTL\n");
+            ret = copy_to_user(argp, &test, sizeof(test));
+            break;
+        case K2_IOC_WRITE_TEST:
+            printk(KERN_INFO "k2: received WRITE TEST IOCTL\n");
+            ret = copy_from_user(&test, argp, sizeof(test));
+            if (!ret) {
+                printk(KERN_INFO "k2: received WRITE TEST with input %d\n", test);
+            } else {
+                printk(KERN_INFO "k2: WRITE TEST failed with error %lu\n", ret);
+            }
+            break;
+        case K2_IOC_WRITE_READ_TEST:
+            printk(KERN_INFO "k2: received WRITE READ TEST IOCTL\n");
+            ret = copy_from_user(&test, argp, sizeof(test));
+            if (!ret) {
+                printk(KERN_INFO "k2: received WRITE READ TEST with input %d\n", test);
+            } else {
+                printk(KERN_INFO "k2: WRITE READ TEST failed with error %lu\n", ret);
+                break;
+            }
+            test *= 2;
+            ret = copy_to_user(argp, &test, sizeof(test));
+            break;
+        default:
+            return -EINVAL;
+    }
+    return (long) ret;
+}
+
+static const struct file_operations k2_dev_fops = {
+        .owner = THIS_MODULE,
+        .llseek = noop_llseek,// As in btrfs driver registration
+        .read = NULL,
+        .write = NULL,
+        .open = k2_dev_open,
+        .release = k2_dev_release,
+        .unlocked_ioctl = k2_dev_ioctl,
+        .compat_ioctl = compat_ptr_ioctl,// https://docs.kernel.org/driver-api/ioctl.html#bit-compat-mode
+};
+
+static void k2_close_dev(void) {
+    if (global_k2_dev) {
+        if (global_k2_dev->device) {
+            struct class *k2_class = global_k2_dev->device->class;
+            device_destroy(k2_class, global_k2_dev->cdev.dev);
+            class_destroy(k2_class);
+        }
+        unregister_chrdev_region(global_k2_dev->cdev.dev, 1);
+        cdev_del(&global_k2_dev->cdev);
+        unregister_chrdev_region(global_k2_dev->cdev.dev, K2_NUMBER_DEVICES);
+        kfree(global_k2_dev);
+    }
+    global_k2_dev = NULL;
+}
+
+static int k2_init_dev(void) {
+    dev_t device_id;
+    int error = 0;
+    struct class *k2_class = NULL;
+    struct device *k2_device = NULL;
+
+    error = alloc_chrdev_region(&device_id, 0, K2_NUMBER_DEVICES, K2_DEVICE_NAME);
+    if (error < 0) {
+        printk(KERN_ERR
+               "k2: could not allocate device: alloc_chrdev_region() failed: %d",
+               error);
+        goto abort;
+    }
+
+    global_k2_dev = kzalloc(sizeof(struct k2_dev), GFP_KERNEL);
+    if (NULL == global_k2_dev) {
+        printk(KERN_ERR
+               "k2: could not allocate device: device struct kzalloc() failed");
+        error = -ENOMEM;
+        goto abort;
+    }
+
+    cdev_init(&global_k2_dev->cdev, &k2_dev_fops);
+    global_k2_dev->cdev.owner = THIS_MODULE;
+    global_k2_dev->cdev.ops = &k2_dev_fops;
+    error = cdev_add(&global_k2_dev->cdev, device_id, 1);
+    if (error) {
+        printk(KERN_ERR "k2: could not allocate device: cdev_add() failed");
+        goto abort;
+    }
+
+    printk(KERN_INFO "k2: Initialized device with Major device number: %d and "
+                     "Minor device number: %d",
+           MAJOR(global_k2_dev->cdev.dev), MINOR(global_k2_dev->cdev.dev));
+
+    k2_class = class_create(THIS_MODULE, K2_DEVICE_NAME);
+    if (IS_ERR(k2_class)) {
+        printk(KERN_ERR "k2: could not allocate device: class_create() failed");
+        error = -EEXIST;// I do not know what else to put here :/
+        goto abort;
+    }
+
+    k2_device = device_create(k2_class, NULL, device_id, NULL, K2_DEVICE_NAME);
+    if (IS_ERR(k2_device)) {
+        printk(KERN_ERR "k2: could not allocate device: device_create() failed");
+        class_destroy(k2_class);
+        error = -EEXIST;// I do not know what else to put here :/
+        goto abort;
+    }
+
+    global_k2_dev->device = k2_device;
+    printk(KERN_INFO "k2: Initialized device node: /dev/%s", K2_DEVICE_NAME);
+
+    return 0;
+
+abort:
+    k2_close_dev();
+    return error;
+}
 
 /* =============================
  * ==== K2 helper functions ====
@@ -752,16 +937,20 @@ static struct elevator_type k2_iosched = {
  * ==== MODULE REGISTRATION ====
  * ========================== */
 
-static int __init k2_init(void)
-{
-	printk(KERN_INFO "k2: Loading K2 I/O scheduler.\n");
-	return(elv_register(&k2_iosched));
+static int __init k2_init(void) {
+    int error = 0;
+    printk(KERN_INFO "k2: Loading K2 I/O scheduler.\n");
+    error = k2_init_dev();
+    if (error) {
+        return error;
+    }
+    return elv_register(&k2_iosched);
 }
 
-static void __exit k2_exit(void)
-{
-	printk(KERN_INFO "k2: Unloading K2 I/O scheduler.\n");
-	elv_unregister(&k2_iosched);
+static void __exit k2_exit(void) {
+    printk(KERN_INFO "k2: Unloading K2 I/O scheduler.\n");
+    elv_unregister(&k2_iosched);
+    k2_close_dev();
 }
 
 module_init(k2_init);
