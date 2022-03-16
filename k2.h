@@ -4,18 +4,19 @@
 /**
  * @brief simple struct to encode ioctl requests
  */
+#define K2_IOCTL_BLK_DEV_NAME_LENGTH 32
+#define K2_IOCTL_CHAR_PARAM_LENGTH 64
 struct k2_ioctl {
-    const char* dev_name;
-    __u32 dev_name_len;
+    const char* blk_dev;
 
     union {
-        char* string_in;
-        __u32 u32_in;
+        char* string_param;
+        __u32 u32_param;
+        pid_t task_pid;
     };
 
     union {
-        char* string_ret;
-        __u32 u32_ret;
+      __u32 interval_ns;
     };
 };
 
@@ -24,11 +25,10 @@ struct k2_ioctl {
  * For now, this seems to work on my machine (TM).
  */
 #define K2_IOCTL_MAGIC 'W'
-#define K2_IOC_GET_VERSION _IOR(K2_IOCTL_MAGIC, 1, int)
-#define K2_IOC_READ_TEST _IOR(K2_IOCTL_MAGIC, 6, __u32)
-#define K2_IOC_WRITE_TEST _IOW(K2_IOCTL_MAGIC, 7, __u32)
-#define K2_IOC_WRITE_READ_TEST _IOWR(K2_IOCTL_MAGIC, 8, __u32)
+#define K2_IOC_GET_VERSION _IOWR(K2_IOCTL_MAGIC, 1, struct k2_ioctl)
+#define K2_IOC_GET_DEVICES _IOWR(K2_IOCTL_MAGIC, 2, struct k2_ioctl)
 
+#define K2_IOC_REGISTER_PERIODIC_TASK _IOR(K2_IOCTL_MAGIC, 8, struct k2_ioctl)
 #define K2_IOC_CURRENT_INFLIGHT_LATENCY _IOWR(K2_IOCTL_MAGIC, 9, struct k2_ioctl)
 
 
