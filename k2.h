@@ -28,7 +28,8 @@ struct k2_ioctl {
 #define K2_IOC_GET_VERSION _IOWR(K2_IOCTL_MAGIC, 1, struct k2_ioctl)
 #define K2_IOC_GET_DEVICES _IOWR(K2_IOCTL_MAGIC, 2, struct k2_ioctl)
 
-#define K2_IOC_REGISTER_PERIODIC_TASK _IOR(K2_IOCTL_MAGIC, 8, struct k2_ioctl)
+#define K2_IOC_REGISTER_PERIODIC_TASK _IOR(K2_IOCTL_MAGIC, 7, struct k2_ioctl)
+#define K2_IOC_UNREGISTER_PERIODIC_TASK _IOR(K2_IOCTL_MAGIC, 8, struct k2_ioctl)
 #define K2_IOC_CURRENT_INFLIGHT_LATENCY _IOWR(K2_IOCTL_MAGIC, 9, struct k2_ioctl)
 
 

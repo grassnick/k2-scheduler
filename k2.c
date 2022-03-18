@@ -150,6 +150,11 @@ struct k2_dynamic_rt_rq {
     //u8 prio;
 
     /**
+     * @brief The interval, these requests will occur
+     */
+     latency_us_t interval;
+
+    /**
      * @brief The list of requests that are part of this request queue
      */
     struct list_head reqs;
@@ -164,7 +169,7 @@ struct k2_dynamic_rt_rq {
  * ===== FUNCTION PROTOTYPES =====
  * ============================ */
 
-static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid);
+static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_us_t interval);
 static int k2_del_dynamic_rt_rq(struct k2_data* k2d, pid_t pid);
 static struct k2_data* k2_get_k2d_by_disk(const char* disk_name);
 
@@ -324,12 +329,36 @@ static long k2_dev_ioctl(struct file *file, unsigned int cmd,
             if (NULL == k2d) {
                 return -ENOENT;
             }
-            ret = k2_add_dynamic_rt_rq(k2d, ioctl.task_pid);
+            ret = k2_add_dynamic_rt_rq(k2d, ioctl.task_pid, ioctl.interval_ns);
             if (ret) {
                 break;
             }
-            printk(KERN_INFO "k2: Registered periodic task for pid %d on %s", ioctl.task_pid, dev);
+            printk(KERN_INFO "k2: Registered periodic task with pid %d on %s", ioctl.task_pid, dev);
             break;
+
+        case K2_IOC_UNREGISTER_PERIODIC_TASK:
+            ret = copy_from_user(&ioctl, argp, sizeof(ioctl));
+            if(ret) {
+                break;
+            }
+            ret = copy_from_user(dev, ioctl.blk_dev, K2_IOCTL_BLK_DEV_NAME_LENGTH);
+            if(ret) {
+                break;
+            }
+            printk(KERN_INFO "k2: Requesting unregistration of periodic task with PID %u and interval of %u ns for %s\n"
+            , ioctl.task_pid, ioctl.interval_ns, dev);
+
+            k2d = k2_get_k2d_by_disk(dev);
+            if (NULL == k2d) {
+                return -ENOENT;
+            }
+            ret = k2_del_dynamic_rt_rq(k2d, ioctl.task_pid);
+            if (ret) {
+                break;
+            }
+            printk(KERN_INFO "k2: Unegistered periodic task with pid %d on %s", ioctl.task_pid, dev);
+            break;
+
 
         case K2_IOC_GET_DEVICES:
             ret = copy_from_user(&ioctl, argp, sizeof(struct k2_ioctl));
@@ -728,7 +757,7 @@ static inline bool k2_does_request_fit(struct k2_data* k2d, struct request* rq) 
     return does_fit;
 }
 
-static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid) {
+static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_us_t interval) {
     struct k2_dynamic_rt_rq* rq;
     struct list_head* list_elem;
     unsigned long flags;
@@ -759,6 +788,7 @@ static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid) {
     INIT_LIST_HEAD(&rq->list);
     INIT_LIST_HEAD(&rq->reqs);
     rq->pid = pid;
+    rq->interval = interval;
 
     // Register this request queue
     list_add_tail(&rq->list, &k2d->rt_dynamic_rqs);
@@ -782,9 +812,11 @@ static int k2_del_dynamic_rt_rq(struct k2_data* k2d, pid_t pid) {
     if(!list_empty(&k2d->rt_dynamic_rqs)) {
         list_for_each_safe(list_elem, tmp, &k2d->rt_dynamic_rqs) {
             rq = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
-            list_del(list_elem);
-            kfree(rq);
-            goto finally;
+            if (rq->pid == pid) {
+                list_del(list_elem);
+                kfree(rq);
+                goto finally;
+            }
         }
     }
 
