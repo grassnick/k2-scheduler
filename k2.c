@@ -292,7 +292,7 @@ static long k2_dev_ioctl(struct file *file, unsigned int cmd,
             if (ret) {
                 break;
             }
-            ret = copy_to_user(ioctl.string_param, THIS_MODULE->version, min(strlen(THIS_MODULE->version), K2_IOCTL_CHAR_PARAM_LENGTH));
+            ret = copy_to_user(ioctl.string_param, THIS_MODULE->version, min(strlen(THIS_MODULE->version), (unsigned long)K2_IOCTL_CHAR_PARAM_LENGTH));
             break;
 
         case K2_IOC_CURRENT_INFLIGHT_LATENCY:
