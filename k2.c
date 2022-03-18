@@ -37,19 +37,30 @@
  */
 #include <trace/events/block.h>
 
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/blkdev.h>
-#include <linux/elevator.h>
 #include <linux/bio.h>
 #include <linux/blk-mq.h>
+#include <linux/blkdev.h>
+#include <linux/cdev.h>
+#include <linux/elevator.h>
+#include <linux/fs.h>
+#include <linux/init.h>
+#include <linux/ioctl.h>
 #include <linux/ioprio.h>
+#include <linux/kernel.h>
 #include <linux/limits.h>
+#include <linux/miscdevice.h>
+#include <linux/module.h>
+#include <linux/uaccess.h>
 
 #define CREATE_TRACE_POINTS
+
+// Tracing related
 #include "k2_trace.h"
+
 EXPORT_TRACEPOINT_SYMBOL_GPL(k2_completed_request);
+
+// Device and ioctl related
+#include "k2.h"
 
 /** Macro to disable Kernel massages meant for debugging */
 #define K2_LOG(log)
@@ -73,9 +84,12 @@ typedef u32 latency_us_t;
 #define K2_32K 32 << 10
 #define K2_2048K 2 << 20
 
-
 extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
 		struct request **merged_request);
+
+/* ===============================
+ * ===== STRUCT DEFINITIONS ======
+ * ============================ */
 
 /**
  * @brief Global K2 data structure
@@ -107,7 +121,57 @@ struct k2_data {
 	struct rb_root sort_list[2];
 
 	spinlock_t lock;
+
+    /* Collect k2_data structs for different gendisks in the global struct */
+    struct list_head global_k2_list_element;
+
+    /* The request queue this elevator is attached to */
+    struct request_queue* rq;
+
+    /* Dynamically generated realtime I/O request queues */
+    struct list_head rt_dynamic_rqs;
 };
+
+/**
+ * @brief A dynamically allocated request queue inside a k2_data structure
+ * @details Used, whenever userspace registers a special io treatment of a process via ioctl
+ *  Access __MUST__ always occur from a locked k2_data struct
+ */
+struct k2_dynamic_rt_rq {
+    /**
+     * @brief The process this request queue serves
+     */
+    pid_t pid;
+
+    /**
+     * @brief IO Priority class of the process - this can change dynamically!
+     * @details read directly from head request
+     */
+    //u8 prio;
+
+    /**
+     * @brief The interval, these requests will occur
+     */
+     latency_us_t interval;
+
+    /**
+     * @brief The list of requests that are part of this request queue
+     */
+    struct list_head reqs;
+
+    /**
+     * @brief The list element to queue this object in the list of dynamic request queues of a k2 instance
+     */
+    struct list_head list;
+};
+
+/* ===============================
+ * ===== FUNCTION PROTOTYPES =====
+ * ============================ */
+
+static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_us_t interval);
+static int k2_del_dynamic_rt_rq(struct k2_data* k2d, pid_t pid);
+static struct k2_data* k2_get_k2d_by_disk(const char* disk_name);
 
 /* =========================
  * ===== SYSFS RELATED =====
@@ -157,9 +221,253 @@ static struct elv_fs_entry k2_attrs[] = {
     __ATTR_RO(current_inflight),
     __ATTR(max_inflight_latency, S_IRUGO | S_IWUSR, k2_max_inflight_latency_show,k2_max_inflight_latency_set),
     __ATTR_RO(current_inflight_latency),
-    __ATTR_NULL
+    __ATTR_NULL};
+
+
+/* ===============
+ * ==== IOCTL ====
+ * ============ */
+
+/**
+ * @See https://static.lwn.net/images/pdf/LDD3/ch03.pdf
+ */
+#define K2_DEVICE_NAME "k2-iosched"
+#define K2_NUMBER_DEVICES 1
+
+/**
+ * @brief Global k2 dev instance
+ */
+struct k2_dev {
+    /**
+     * @brief Character device handle
+     * @details Required for registration of device
+     */
+    struct cdev cdev;
+
+    /**
+     * @brief device not handle for registration on /dev
+     */
+    struct device *device;
+
+    /**
+     * @brief list of running instances of the scheduler per gendisk
+     */
+    struct list_head k2_instances;
+
+    spinlock_t lock;
+
+    // TODO: Add lock to cover race conditions
 };
 
+/**
+ * @brief Global device pointer for ioctl interaction
+ * @details Always check for NULL, make sure to deallocate on module cleanup
+ */
+static struct k2_dev *k2_global_k2_dev = NULL;
+
+
+static int k2_dev_open(struct inode *inode, struct file *filp) { return 0; }
+
+static int k2_dev_release(struct inode *inode, struct file *filp) { return 0; }
+
+/**
+ * @brief Entry point for ioctl requests
+ */
+static long k2_dev_ioctl(struct file *file, unsigned int cmd,
+                         unsigned long arg) {
+    // struct inode *inode = file_inode(file);
+
+    void __user *argp = (void __user *) arg;
+    unsigned long ret = 0;
+    struct k2_ioctl ioctl;
+    char dev[K2_IOCTL_BLK_DEV_NAME_LENGTH];
+    struct list_head* list_element;
+    struct k2_data* k2d;
+    char string_param[K2_IOCTL_CHAR_PARAM_LENGTH];
+    char* separator = ";";
+
+    memset(string_param, 0, K2_IOCTL_CHAR_PARAM_LENGTH);
+    memset(dev, 0, K2_IOCTL_BLK_DEV_NAME_LENGTH);
+    memset(&ioctl, 0, sizeof(ioctl));
+
+    switch (cmd) {
+
+        case K2_IOC_GET_VERSION:
+            ret = copy_from_user(&ioctl, argp, sizeof(struct k2_ioctl));
+            if (ret) {
+                break;
+            }
+            ret = copy_to_user(ioctl.string_param, THIS_MODULE->version, min(strlen(THIS_MODULE->version), (unsigned long)K2_IOCTL_CHAR_PARAM_LENGTH));
+            break;
+
+        case K2_IOC_REGISTER_PERIODIC_TASK:
+            ret = copy_from_user(&ioctl, argp, sizeof(ioctl));
+            if(ret) {
+              break;
+            }
+            ret = copy_from_user(dev, ioctl.blk_dev, K2_IOCTL_BLK_DEV_NAME_LENGTH);
+            if(ret) {
+              break;
+            }
+            printk(KERN_INFO "k2: Requesting periodic task with pid %u and interval of %u ns for %s\n"
+                   , ioctl.task_pid, ioctl.interval_ns, dev);
+            k2d = k2_get_k2d_by_disk(dev);
+            if (NULL == k2d) {
+                return -ENOENT;
+            }
+            ret = k2_add_dynamic_rt_rq(k2d, ioctl.task_pid, ioctl.interval_ns);
+            if (ret) {
+                break;
+            }
+            printk(KERN_INFO "k2: Registered periodic task with pid %d on %s\n", ioctl.task_pid, dev);
+            break;
+
+        case K2_IOC_UNREGISTER_PERIODIC_TASK:
+            ret = copy_from_user(&ioctl, argp, sizeof(ioctl));
+            if(ret) {
+                break;
+            }
+            ret = copy_from_user(dev, ioctl.blk_dev, K2_IOCTL_BLK_DEV_NAME_LENGTH);
+            if(ret) {
+                break;
+            }
+            printk(KERN_INFO "k2: Requesting unregistration of periodic task with pid %u for %s\n", ioctl.task_pid, dev);
+
+            k2d = k2_get_k2d_by_disk(dev);
+            if (NULL == k2d) {
+                return -ENOENT;
+            }
+            ret = k2_del_dynamic_rt_rq(k2d, ioctl.task_pid);
+            if (ret) {
+                break;
+            }
+            printk(KERN_INFO "k2: Unregistered periodic task with pid %d on %s\n", ioctl.task_pid, dev);
+            break;
+
+
+        case K2_IOC_GET_DEVICES:
+            ret = copy_from_user(&ioctl, argp, sizeof(struct k2_ioctl));
+            if (ret) {
+                break;
+            }
+            if (list_empty(&k2_global_k2_dev->k2_instances)) {
+                break;
+            }
+            list_element = k2_global_k2_dev->k2_instances.next;
+            while (list_element != &k2_global_k2_dev->k2_instances) {
+                k2d = list_entry(list_element, struct k2_data, global_k2_list_element);
+                printk(KERN_INFO "k2: k2 is active on /dev/%s\n", k2d->rq->disk->disk_name);
+                if (strlen(string_param) + strlen(k2d->rq->disk->disk_name) + strlen(separator) < K2_IOCTL_CHAR_PARAM_LENGTH) {
+                    strcpy(string_param + strlen(string_param), separator);
+                    memcpy(string_param + strlen(string_param), k2d->rq->disk->disk_name, strlen(k2d->rq->disk->disk_name));
+                }
+                if (list_element->next) {
+                    list_element = list_element->next;
+                }
+            }
+            printk(KERN_INFO "k2: k2 is active on %s\n", string_param);
+
+            ret = copy_to_user(ioctl.string_param, string_param, K2_IOCTL_CHAR_PARAM_LENGTH);
+
+            break;
+        default:
+            return -EINVAL;
+    }
+    return (long) ret;
+}
+
+static const struct file_operations k2_dev_fops = {
+        .owner = THIS_MODULE,
+        .llseek = noop_llseek,// As in btrfs driver registration
+        .read = NULL,
+        .write = NULL,
+        .open = k2_dev_open,
+        .release = k2_dev_release,
+        .unlocked_ioctl = k2_dev_ioctl,
+        .compat_ioctl = compat_ptr_ioctl,// https://docs.kernel.org/driver-api/ioctl.html#bit-compat-mode
+};
+
+static void k2_close_dev(struct k2_dev* device) {
+    if (device) {
+        if (device->device) {
+            struct class *k2_class = device->device->class;
+            device_destroy(k2_class, device->cdev.dev);
+            class_destroy(k2_class);
+        }
+        unregister_chrdev_region(device->cdev.dev, 1);
+        cdev_del(&device->cdev);
+        unregister_chrdev_region(device->cdev.dev, K2_NUMBER_DEVICES);
+        kfree(device);
+    }
+    device = NULL;
+    k2_global_k2_dev = NULL;
+    printk(KERN_INFO "k2: Unregistered device node: /dev/%s", K2_DEVICE_NAME);
+}
+
+static int k2_init_dev(void) {
+    dev_t device_id;
+    int error = 0;
+    struct class *k2_class = NULL;
+    struct device *k2_device = NULL;
+    struct k2_dev* dev;
+
+    dev = kzalloc(sizeof(struct k2_dev), GFP_KERNEL);
+    if (NULL == dev) {
+        printk(KERN_ERR
+                       "k2: could not allocate device: device struct kzalloc() failed");
+        return -ENOMEM;
+    }
+
+    error = alloc_chrdev_region(&device_id, 0, K2_NUMBER_DEVICES, K2_DEVICE_NAME);
+    if (error < 0) {
+        printk(KERN_ERR
+               "k2: could not allocate device: alloc_chrdev_region() failed: %d",
+               error);
+        goto abort;
+    }
+
+    spin_lock_init(&dev->lock);
+
+    cdev_init(&dev->cdev, &k2_dev_fops);
+    dev->cdev.owner = THIS_MODULE;
+    dev->cdev.ops = &k2_dev_fops;
+    error = cdev_add(&dev->cdev, device_id, 1);
+    if (error) {
+        printk(KERN_ERR "k2: could not allocate device: cdev_add() failed");
+        goto abort;
+    }
+
+    printk(KERN_INFO "k2: Initialized device with Major device number: %d and "
+                     "Minor device number: %d",
+           MAJOR(dev->cdev.dev), MINOR(dev->cdev.dev));
+
+    k2_class = class_create(THIS_MODULE, K2_DEVICE_NAME);
+    if (IS_ERR(k2_class)) {
+        printk(KERN_ERR "k2: could not allocate device: class_create() failed");
+        error = -EEXIST;// I do not know what else to put here :/
+        goto abort;
+    }
+
+    k2_device = device_create(k2_class, NULL, device_id, NULL, K2_DEVICE_NAME);
+    if (IS_ERR(k2_device)) {
+        printk(KERN_ERR "k2: could not allocate device: device_create() failed");
+        class_destroy(k2_class);
+        error = -EEXIST;// I do not know what else to put here :/
+        goto abort;
+    }
+
+    INIT_LIST_HEAD(&dev->k2_instances);
+    dev->device = k2_device;
+
+    k2_global_k2_dev = dev;
+    printk(KERN_INFO "k2: Initialized device node: /dev/%s", K2_DEVICE_NAME);
+
+    return 0;
+
+abort:
+    k2_close_dev(dev);
+    return error;
+}
 
 /* =============================
  * ==== K2 helper functions ====
@@ -434,6 +742,110 @@ static inline bool k2_does_request_fit(struct k2_data* k2d, struct request* rq) 
     return does_fit;
 }
 
+static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_us_t interval) {
+    struct k2_dynamic_rt_rq* rq;
+    struct list_head* list_elem;
+    unsigned long flags;
+    int error = 0;
+
+    // TODO: Avoid busy waiting here?
+    spin_lock_irqsave(&k2d->lock, flags);
+
+    // Check if PID is already assigned
+    if(!list_empty(&k2d->rt_dynamic_rqs)) {
+        list_for_each(list_elem, &k2d->rt_dynamic_rqs) {
+            rq = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
+            if(rq->pid == pid) {
+                error = -EEXIST;
+                goto finally;
+            }
+        }
+    }
+
+    // TODO: Is this memory handling correct?
+    rq = kzalloc_node(sizeof(struct k2_dynamic_rt_rq), GFP_KERNEL, k2d->rq->node);
+    if (NULL == rq) {
+        kobject_put(&k2d->rq->elevator->kobj);
+        error = -ENOMEM;
+        goto finally;
+    }
+
+    INIT_LIST_HEAD(&rq->list);
+    INIT_LIST_HEAD(&rq->reqs);
+    rq->pid = pid;
+    rq->interval = interval;
+
+    // Register this request queue
+    list_add_tail(&rq->list, &k2d->rt_dynamic_rqs);
+
+    finally:
+    spin_unlock_irqrestore(&k2d->lock, flags);
+    return error;
+}
+
+static int k2_del_dynamic_rt_rq(struct k2_data* k2d, pid_t pid) {
+    struct k2_dynamic_rt_rq* rq;
+    struct list_head* list_elem;
+    struct list_head* tmp;
+    int error = 0;
+    unsigned long flags;
+
+    // TODO: Avoid busy waiting here?
+    spin_lock_irqsave(&k2d->lock, flags);
+
+    // Check if PID is already assigned
+    if(!list_empty(&k2d->rt_dynamic_rqs)) {
+        list_for_each_safe(list_elem, tmp, &k2d->rt_dynamic_rqs) {
+            rq = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
+            if (rq->pid == pid) {
+                list_del(list_elem);
+                kfree(rq);
+                goto finally;
+            }
+        }
+    }
+
+    error = -ENOENT;
+
+    finally:
+    spin_unlock_irqrestore(&k2d->lock, flags);
+    return error;
+}
+
+/**
+ * @brief Get the k2_data structure active on a certain disk by name
+ * @param disk_name The name of the disk as listed in e.g. /dev/nvme0n1, omit the /dev/ part
+ * @return Pointer to the according k2_data if exists, else NULL
+ */
+static struct k2_data* k2_get_k2d_by_disk(const char* disk_name) {
+    unsigned long flags;
+    struct list_head* list_elem;
+    struct k2_data* ret = NULL;
+    struct k2_data* tmp;
+
+    if (!k2_global_k2_dev) {
+        return NULL;
+    }
+
+    spin_lock_irqsave(&k2_global_k2_dev->lock, flags);
+
+    if (list_empty(&k2_global_k2_dev->k2_instances)) {
+        goto finally;
+    }
+    list_for_each(list_elem, &k2_global_k2_dev->k2_instances) {
+        // TODO: Lock here? Should not be required, as this value should not change.
+        tmp = list_entry(list_elem, struct k2_data, global_k2_list_element);
+        if (strcmp(disk_name, tmp->rq->disk->disk_name) == 0) {
+            ret = tmp;
+            goto finally;
+        }
+    }
+
+    finally:
+    spin_unlock_irqrestore(&k2_global_k2_dev->lock, flags);
+    return ret;
+}
+
 /* ==============================
  * ===== ELEVATOR CALLBACKS =====
  * ============================*/
@@ -476,18 +888,55 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
     k2d->rw_32K_lat = K2_RW_32K_LAT;
     k2d->rw_2048K_lat = K2_RW_2048K_LAT;
 
+    INIT_LIST_HEAD(&k2d->global_k2_list_element);
+
 	spin_lock_init(&k2d->lock);
 
 	rq->elevator = eq;
-	printk(KERN_INFO "k2: I/O scheduler set up.\n");
+
+    k2d->rq = rq;
+
+    INIT_LIST_HEAD(&k2d->rt_dynamic_rqs);
+
+    // Register this instance so it can be addressed from ioctl
+    if(k2_global_k2_dev) {
+        list_add_tail(&k2d->global_k2_list_element, &k2_global_k2_dev->k2_instances);
+    } else {
+        printk(KERN_WARNING "Could not register k2 scheduler instance for device /dev/%s for ioctl interaction", k2d->rq->disk->disk_name);
+    }
+
+	printk(KERN_INFO "k2: I/O scheduler set up for %s\n", rq->disk->disk_name);
 	return(0);
 }
 
 static void k2_exit_sched(struct elevator_queue *eq)
 {
 	struct k2_data *k2d = eq->elevator_data;
+    char* blk_name = k2d->rq->disk->disk_name;
+    struct list_head* list_elem;
+    struct list_head* tmp;
+    struct k2_dynamic_rt_rq* rt_rqs;
+
+    // Delete from global dev node
+    if (k2_global_k2_dev) {
+        list_del(&k2d->global_k2_list_element);
+    }
+
+    // Clean all dynamically allocated request queues
+    if (!list_empty(&k2d->rt_dynamic_rqs)) {
+        list_for_each_safe(list_elem, tmp, &k2d->rt_dynamic_rqs) {
+            rt_rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
+            // TODO: How to handle requests still in software queues?
+            //  Do nothing like in static queues? Are those lost?
+            //  What about the associated kernel memory buffer?
+            printk("k2: Deleting realtime request queue for pid %d on %s", rt_rqs->pid, k2d->rq->disk->disk_name);
+            kfree(rt_rqs);
+        }
+    }
 
 	kfree(k2d);
+    k2d = NULL;
+    printk(KERN_INFO "k2: I/O scheduler unloaded for %s\n", blk_name);
 }
 
 static bool k2_has_work(struct blk_mq_hw_ctx *hctx)
@@ -752,16 +1201,20 @@ static struct elevator_type k2_iosched = {
  * ==== MODULE REGISTRATION ====
  * ========================== */
 
-static int __init k2_init(void)
-{
-	printk(KERN_INFO "k2: Loading K2 I/O scheduler.\n");
-	return(elv_register(&k2_iosched));
+static int __init k2_init(void) {
+    int error = 0;
+    printk(KERN_INFO "k2: Loading K2 I/O scheduler.\n");
+    error = k2_init_dev();
+    if (error) {
+        return error;
+    }
+    return elv_register(&k2_iosched);
 }
 
-static void __exit k2_exit(void)
-{
-	printk(KERN_INFO "k2: Unloading K2 I/O scheduler.\n");
-	elv_unregister(&k2_iosched);
+static void __exit k2_exit(void) {
+    printk(KERN_INFO "k2: Unloading K2 I/O scheduler.\n");
+    elv_unregister(&k2_iosched);
+    k2_close_dev(k2_global_k2_dev);
 }
 
 module_init(k2_init);
