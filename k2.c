@@ -300,20 +300,6 @@ static long k2_dev_ioctl(struct file *file, unsigned int cmd,
             ret = copy_to_user(ioctl.string_param, THIS_MODULE->version, min(strlen(THIS_MODULE->version), (unsigned long)K2_IOCTL_CHAR_PARAM_LENGTH));
             break;
 
-        case K2_IOC_CURRENT_INFLIGHT_LATENCY:
-            ret = copy_from_user(&ioctl, argp, sizeof(struct k2_ioctl));
-            if (ret) {
-                break;
-            }
-            ret = copy_from_user(dev, ioctl.blk_dev,
-                                 K2_IOCTL_BLK_DEV_NAME_LENGTH);
-            if (ret) {
-                break;
-            }
-            ioctl.u32_param = K2_MAX_INFLIGHT_USECONDS;
-            ret = copy_to_user(argp, &ioctl, sizeof(struct k2_ioctl));
-            break;
-
         case K2_IOC_REGISTER_PERIODIC_TASK:
             ret = copy_from_user(&ioctl, argp, sizeof(ioctl));
             if(ret) {
@@ -323,7 +309,7 @@ static long k2_dev_ioctl(struct file *file, unsigned int cmd,
             if(ret) {
               break;
             }
-            printk(KERN_INFO "k2: Requesting periodic task with PID %u and interval of %u ns for %s\n"
+            printk(KERN_INFO "k2: Requesting periodic task with pid %u and interval of %u ns for %s\n"
                    , ioctl.task_pid, ioctl.interval_ns, dev);
             k2d = k2_get_k2d_by_disk(dev);
             if (NULL == k2d) {
@@ -333,7 +319,7 @@ static long k2_dev_ioctl(struct file *file, unsigned int cmd,
             if (ret) {
                 break;
             }
-            printk(KERN_INFO "k2: Registered periodic task with pid %d on %s", ioctl.task_pid, dev);
+            printk(KERN_INFO "k2: Registered periodic task with pid %d on %s\n", ioctl.task_pid, dev);
             break;
 
         case K2_IOC_UNREGISTER_PERIODIC_TASK:
@@ -345,8 +331,7 @@ static long k2_dev_ioctl(struct file *file, unsigned int cmd,
             if(ret) {
                 break;
             }
-            printk(KERN_INFO "k2: Requesting unregistration of periodic task with PID %u and interval of %u ns for %s\n"
-            , ioctl.task_pid, ioctl.interval_ns, dev);
+            printk(KERN_INFO "k2: Requesting unregistration of periodic task with pid %u for %s\n", ioctl.task_pid, dev);
 
             k2d = k2_get_k2d_by_disk(dev);
             if (NULL == k2d) {
@@ -356,7 +341,7 @@ static long k2_dev_ioctl(struct file *file, unsigned int cmd,
             if (ret) {
                 break;
             }
-            printk(KERN_INFO "k2: Unegistered periodic task with pid %d on %s", ioctl.task_pid, dev);
+            printk(KERN_INFO "k2: Unregistered periodic task with pid %d on %s\n", ioctl.task_pid, dev);
             break;
 
 
@@ -850,7 +835,6 @@ static struct k2_data* k2_get_k2d_by_disk(const char* disk_name) {
     list_for_each(list_elem, &k2_global_k2_dev->k2_instances) {
         // TODO: Lock here? Should not be required, as this value should not change.
         tmp = list_entry(list_elem, struct k2_data, global_k2_list_element);
-        printk(KERN_INFO "k2: get k2d by name \"%s\", \"%s\"\n", disk_name, tmp->rq->disk->disk_name);
         if (strcmp(disk_name, tmp->rq->disk->disk_name) == 0) {
             ret = tmp;
             goto finally;
