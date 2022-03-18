@@ -26,11 +26,15 @@ options=()
 install=
 changelog=
 source=("k2.c"
+        "k2.h"
+        "k2_trace.h"
         "Makefile"
 		"dkms.conf"
 )
 noextract=()
 md5sums=("SKIP"
+         "SKIP"
+         "SKIP"
          "SKIP"
 		 "SKIP"
 )
@@ -39,5 +43,7 @@ validpgpkeys=()
 
 package() {
 	mkdir -p "${pkgdir}/usr/src/${_pkgname}-${pkgver}/"
-	install -Dm644 k2.c Makefile dkms.conf -t "${pkgdir}/usr/src/${_pkgname}-${pkgver}/"
+	install -Dm644 k2.c k2.h k2_trace.h Makefile dkms.conf -t "${pkgdir}/usr/src/${_pkgname}-${pkgver}/"
+	mkdir -p ${pkgdir}/usr/lib/modules/$(uname -r)/build/include/trace/events/
+	cp k2_trace.h "${pkgdir}/usr/lib/modules/$(uname -r)/build/include/trace/events/k2.h"
 }
