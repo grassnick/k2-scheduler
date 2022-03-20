@@ -171,6 +171,7 @@ struct k2_dynamic_rt_rq {
 
 static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_us_t interval);
 static int k2_del_dynamic_rt_rq(struct k2_data* k2d, pid_t pid);
+static int k2_del_all_dynamic_rt_rq(struct k2_data* k2d);
 static struct k2_data* k2_get_k2d_by_disk(const char* disk_name);
 
 /* =========================
@@ -344,6 +345,27 @@ static long k2_dev_ioctl(struct file *file, unsigned int cmd,
             printk(KERN_INFO "k2: Unregistered periodic task with pid %d on %s\n", ioctl.task_pid, dev);
             break;
 
+        case  K2_IOC_UNREGISTER_ALL_PERIODIC_TASKS:
+            ret = copy_from_user(&ioctl, argp, sizeof(ioctl));
+            if(ret) {
+                break;
+            }
+            ret = copy_from_user(dev, ioctl.blk_dev, K2_IOCTL_BLK_DEV_NAME_LENGTH);
+            if(ret) {
+                break;
+            }
+            printk(KERN_INFO "k2: Requesting unregistration of all periodic tasks for %s\n", dev);
+
+            k2d = k2_get_k2d_by_disk(dev);
+            if (NULL == k2d) {
+                return -ENOENT;
+            }
+            ret = k2_del_all_dynamic_rt_rq(k2d);
+            if (ret) {
+                break;
+            }
+            printk(KERN_INFO "k2: Unregistered all periodic tasks on %s\n", dev);
+            break;
 
         case K2_IOC_GET_DEVICES:
             ret = copy_from_user(&ioctl, argp, sizeof(struct k2_ioctl));
@@ -370,6 +392,7 @@ static long k2_dev_ioctl(struct file *file, unsigned int cmd,
             ret = copy_to_user(ioctl.string_param, string_param, K2_IOCTL_CHAR_PARAM_LENGTH);
 
             break;
+
         default:
             return -EINVAL;
     }
@@ -784,7 +807,7 @@ static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_us_t int
 }
 
 static int k2_del_dynamic_rt_rq(struct k2_data* k2d, pid_t pid) {
-    struct k2_dynamic_rt_rq* rq;
+    struct k2_dynamic_rt_rq* rqs;
     struct list_head* list_elem;
     struct list_head* tmp;
     int error = 0;
@@ -796,10 +819,10 @@ static int k2_del_dynamic_rt_rq(struct k2_data* k2d, pid_t pid) {
     // Check if PID is already assigned
     if(!list_empty(&k2d->rt_dynamic_rqs)) {
         list_for_each_safe(list_elem, tmp, &k2d->rt_dynamic_rqs) {
-            rq = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
-            if (rq->pid == pid) {
+            rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
+            if (rqs->pid == pid) {
                 list_del(list_elem);
-                kfree(rq);
+                kfree(rqs);
                 goto finally;
             }
         }
@@ -808,6 +831,32 @@ static int k2_del_dynamic_rt_rq(struct k2_data* k2d, pid_t pid) {
     error = -ENOENT;
 
     finally:
+    spin_unlock_irqrestore(&k2d->lock, flags);
+    return error;
+}
+
+static int k2_del_all_dynamic_rt_rq(struct k2_data* k2d) {
+    struct k2_dynamic_rt_rq* rqs;
+    struct list_head* list_elem;
+    struct list_head* tmp;
+    int error = 0;
+    unsigned long flags;
+
+    // TODO: Avoid busy waiting here?
+    spin_lock_irqsave(&k2d->lock, flags);
+
+    if (!list_empty(&k2d->rt_dynamic_rqs)) {
+        list_for_each_safe(list_elem, tmp, &k2d->rt_dynamic_rqs) {
+            rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
+            // TODO: How to handle requests still in software queues?
+            //  Do nothing like in static queues? Are those lost?
+            //  What about the associated kernel memory buffer?
+            printk("k2: Deleting realtime request queue for pid %d on %s", rqs->pid, k2d->rq->disk->disk_name);
+            list_del(list_elem);
+            kfree(rqs);
+        }
+    }
+
     spin_unlock_irqrestore(&k2d->lock, flags);
     return error;
 }
@@ -922,17 +971,7 @@ static void k2_exit_sched(struct elevator_queue *eq)
         list_del(&k2d->global_k2_list_element);
     }
 
-    // Clean all dynamically allocated request queues
-    if (!list_empty(&k2d->rt_dynamic_rqs)) {
-        list_for_each_safe(list_elem, tmp, &k2d->rt_dynamic_rqs) {
-            rt_rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
-            // TODO: How to handle requests still in software queues?
-            //  Do nothing like in static queues? Are those lost?
-            //  What about the associated kernel memory buffer?
-            printk("k2: Deleting realtime request queue for pid %d on %s", rt_rqs->pid, k2d->rq->disk->disk_name);
-            kfree(rt_rqs);
-        }
-    }
+    k2_del_all_dynamic_rt_rq(k2d);
 
 	kfree(k2d);
     k2d = NULL;

@@ -30,6 +30,7 @@ struct k2_ioctl {
 
 #define K2_IOC_REGISTER_PERIODIC_TASK _IOR(K2_IOCTL_MAGIC, 7, struct k2_ioctl)
 #define K2_IOC_UNREGISTER_PERIODIC_TASK _IOR(K2_IOCTL_MAGIC, 8, struct k2_ioctl)
+#define K2_IOC_UNREGISTER_ALL_PERIODIC_TASKS _IOR(K2_IOCTL_MAGIC, 12, struct k2_ioctl)
 
 
 
