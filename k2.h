@@ -16,7 +16,7 @@ struct k2_ioctl {
     };
 
     union {
-      __u32 interval_ns;
+      __s64 interval_ns; // ktime_t
     };
 };
 

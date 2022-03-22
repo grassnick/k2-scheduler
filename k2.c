@@ -50,11 +50,11 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(k2_completed_request);
 /** Macro to disable Kernel massages meant for debugging */
 #define K2_LOG(log)
 
-/** A type that represents the latency of a request in us */
-typedef u32 latency_us_t;
-#define LATENCY_US_T_MAX U32_MAX
+/** A type that represents the latency of a request */
+typedef ktime_t latency_ns_t;
+#define LATENCY_US_T_MAX KTIME_MAX
 
-/** The number of requests that can always be in flight, needs to be > 1, else scheduler might stall */
+/** The number of requests that can always be in flight, needs to be > 0, else scheduler might stall */
 #define K2_MINIMUM_COHERENT_REQUEST_COUNT 2
 static_assert(K2_MINIMUM_COHERENT_REQUEST_COUNT > 0);
 
@@ -86,21 +86,42 @@ extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
  *  Parallel modifications to this struct MUST ensure synchronous access provided via the k2_data::lock member
  */
 struct k2_data {
+    /**
+     * @brief The number of requests currently dispatched to the device
+     * @details Incremented in k2_dispatch(), decremented in k2_completed_request()
+     */
 	unsigned int inflight;
-    latency_us_t current_inflight_latency;
-    latency_us_t max_inflight_latency;
-    latency_us_t lowest_upcoming_latency;
+
+    /**
+     * @brief The sum of estimated processing times of requests currently dispatched
+     * @details Increased in k2_dispatch(), decresed in k2_completed_request()
+     */
+    latency_ns_t current_inflight_latency;
+
+    /**
+     * @brief The maximum sum of estimated latencies in flight at any time
+     * @details The scheduler will stall requests, that would exceed this limit
+     */
+    latency_ns_t max_inflight_latency;
+
+    /**
+     * @brief The lowest upcoming estimated request processing time in any software scheduler request queue
+     * @details Speeds up k2_has_work() checks
+     */
+    latency_ns_t lowest_upcoming_latency;
+
+
 
     /* Expected latencies for typical access sizes */
     /* Random Read */
-    latency_us_t rr_512_lat;
-    latency_us_t rr_32K_lat;
-    latency_us_t rr_2048K_lat;
+    latency_ns_t rr_512_lat;
+    latency_ns_t rr_32K_lat;
+    latency_ns_t rr_2048K_lat;
 
     /* Random Write */
-    latency_us_t rw_512_lat;
-    latency_us_t rw_32K_lat;
-    latency_us_t rw_2048K_lat;
+    latency_ns_t rw_512_lat;
+    latency_ns_t rw_32K_lat;
+    latency_ns_t rw_2048K_lat;
 
 	/* further group real-time requests by I/O priority */
 	struct list_head rt_reqs[IOPRIO_BE_NR];
@@ -157,7 +178,7 @@ struct k2_dynamic_rt_rq {
     /**
      * @brief The interval, these requests will occur
      */
-     latency_us_t interval;
+     latency_ns_t interval;
 
     /**
      * @brief The list of requests that are part of this request queue
@@ -174,7 +195,7 @@ struct k2_dynamic_rt_rq {
  * ===== FUNCTION PROTOTYPES =====
  * ============================ */
 
-static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_us_t interval);
+static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_ns_t interval);
 static int k2_del_dynamic_rt_rq(struct k2_data* k2d, pid_t pid);
 static int k2_del_all_dynamic_rt_rq(struct k2_data* k2d);
 static struct k2_data* k2_get_k2d_by_disk(const char* disk_name);
@@ -187,7 +208,7 @@ ssize_t k2_max_inflight_latency_show(struct elevator_queue *eq, char *s)
 {
     struct k2_data *k2d = eq->elevator_data;
 
-    return(sprintf(s, "%u\n", k2d->max_inflight_latency));
+    return(sprintf(s, "%lld\n", k2d->max_inflight_latency));
 }
 
 ssize_t k2_max_inflight_latency_set(struct elevator_queue *eq, const char *s,
@@ -201,7 +222,7 @@ ssize_t k2_max_inflight_latency_set(struct elevator_queue *eq, const char *s,
         spin_lock_irqsave(&k2d->lock, flags);
         k2d->max_inflight_latency = new_max;
         spin_unlock_irqrestore(&k2d->lock, flags);
-        printk(KERN_INFO "k2: max_inflight set to %u\n",
+        printk(KERN_INFO "k2: max_inflight set to %lld\n",
                k2d->max_inflight_latency);
 
         return(size);
@@ -214,7 +235,7 @@ ssize_t k2_max_inflight_latency_set(struct elevator_queue *eq, const char *s,
 ssize_t current_inflight_latency_show(struct elevator_queue *eq, char *s)
 {
     struct k2_data *k2d = eq->elevator_data;
-    return(sprintf(s, "%u\n", k2d->current_inflight_latency));
+    return(sprintf(s, "%lld\n", k2d->current_inflight_latency));
 }
 
 ssize_t current_inflight_show(struct elevator_queue *eq, char *s)
@@ -315,7 +336,7 @@ static long k2_dev_ioctl(struct file *file, unsigned int cmd,
             if(ret) {
               break;
             }
-            printk(KERN_INFO "k2: Requesting periodic task with pid %u and interval of %u ns for %s\n"
+            printk(KERN_INFO "k2: Requesting periodic task with pid %u and interval of %lld ns for %s\n"
                    , ioctl.task_pid, ioctl.interval_ns, dev);
             k2d = k2_get_k2d_by_disk(dev);
             if (NULL == k2d) {
@@ -583,12 +604,12 @@ static void k2_remove_request(struct request_queue *q, struct request *r)
         q->last_merge = NULL;
 }
 
-static latency_us_t k2_linear_interpolation(const u32 val
+static latency_ns_t k2_linear_interpolation(const u32 val
         , const u32 lower_val, const u32 upper_val
-        , const latency_us_t lower_lat, const latency_us_t upper_lat)
+        , const latency_ns_t lower_lat, const latency_ns_t upper_lat)
 {
     const u32 diff_val = upper_val - lower_val;
-    const u32 diff_lat = upper_lat - lower_lat;
+    const latency_ns_t diff_lat = ktime_sub(upper_lat, lower_lat);
     const u32 offset_val = val - lower_val;
     const u32 value_percentage = 100 * offset_val / diff_val;
     return lower_lat + diff_lat * value_percentage / 100;
@@ -598,13 +619,13 @@ static latency_us_t k2_linear_interpolation(const u32 val
 /**
  * @brief Determine the expected latency of a request
  */
-static latency_us_t k2_expected_request_latency(struct k2_data* k2d, struct request* rq)
+static latency_ns_t k2_expected_request_latency(struct k2_data* k2d, struct request* rq)
 {
     const unsigned int rq_size = blk_rq_bytes(rq);
     //unsigned int rq_sectors = blk_rq_sectors(rq);
 
     // Requests that are neither write nor read are not taken into account
-    latency_us_t rq_lat = 0;
+    latency_ns_t rq_lat = 0;
 
     K2_LOG(printk(KERN_INFO "k2: Request size: %u (%uk)", rq_size, rq_size / 1024));
 
@@ -636,7 +657,7 @@ static latency_us_t k2_expected_request_latency(struct k2_data* k2d, struct requ
         default:
             K2_LOG(printk(KERN_INFO "k2: Request is misc: %u", rq->cmd_flags & REQ_OP_MASK));
     }
-    K2_LOG(printk(KERN_INFO "k2: Expected introduced latency: %u", rq_lat));
+    K2_LOG(printk(KERN_INFO "k2: Expected introduced latency: %lld", rq_lat));
     return rq_lat;
 
     legacy:
@@ -649,10 +670,10 @@ static latency_us_t k2_expected_request_latency(struct k2_data* k2d, struct requ
  * @details For assigning additional data to each request, the kernel offers certain pointers in the request struct.
  * Apply some magic casting and be done with it.
  * */
-static inline void k2_set_rq_latency(struct request* rq, latency_us_t rq_lat)
+static inline void k2_set_rq_latency(struct request* rq, latency_ns_t rq_lat)
 {
-    rq->elv.priv[0] = (void*)(unsigned long)rq_lat;
-    rq->elv.priv[1] = (void*)(unsigned long)blk_rq_bytes(rq);
+    rq->elv.priv[0] = (void*)(latency_ns_t)rq_lat;
+    rq->elv.priv[1] = (void*)(latency_ns_t)blk_rq_bytes(rq);
 }
 
 /**
@@ -660,7 +681,7 @@ static inline void k2_set_rq_latency(struct request* rq, latency_us_t rq_lat)
  * @details For assigning additional data to each request, the kernel offers certain pointers in the request struct
  * Apply some magic casting and be done with it.
  * */
-static inline latency_us_t k2_get_rq_latency(struct request* rq)
+static inline latency_ns_t k2_get_rq_latency(struct request* rq)
 {
     return (uintptr_t)rq->elv.priv[0];
 }
@@ -674,12 +695,12 @@ static inline latency_us_t k2_get_rq_latency(struct request* rq)
  */
 static inline void k2_add_latency(struct k2_data* k2d, struct request* rq)
 {
-    unsigned int count = k2d->inflight + 1;
-    latency_us_t lat = k2d->current_inflight_latency + k2_get_rq_latency(rq);
+    const unsigned int count = k2d->inflight + 1;
+    const latency_ns_t lat = ktime_add(k2d->current_inflight_latency, k2_get_rq_latency(rq));
 
     assert_spin_locked(&k2d->lock);
 
-    K2_LOG(printk(KERN_DEBUG "k2: Added: current inflight %u, current_latency %u", count, lat));
+    K2_LOG(printk(KERN_DEBUG "k2: Added: current inflight %u, current_latency %lld", count, lat));
 
     k2d->inflight = count;
     k2d->current_inflight_latency = lat;
@@ -695,7 +716,7 @@ static inline void k2_add_latency(struct k2_data* k2d, struct request* rq)
 static inline void k2_remove_latency(struct k2_data* k2d, struct request* rq)
 {
     unsigned int count;
-    latency_us_t lat;
+    latency_ns_t lat;
 
     assert_spin_locked(&k2d->lock);
 
@@ -712,7 +733,7 @@ static inline void k2_remove_latency(struct k2_data* k2d, struct request* rq)
         lat = 0;
     }
 
-    K2_LOG(printk(KERN_DEBUG "k2: Removed: current inflight %u, current_latency %u", count, lat));
+    K2_LOG(printk(KERN_DEBUG "k2: Removed: current inflight %u, current_latency %lld", count, lat));
 
     k2d->inflight = count;
     k2d->current_inflight_latency = lat;
@@ -730,8 +751,8 @@ static void k2_update_lowest_pending_latency(struct k2_data* k2d)
     struct request* rq;
     struct list_head* list_item;
     struct k2_dynamic_rt_rq* rt_rqs;
-    latency_us_t lowest_lat = LATENCY_US_T_MAX;
-    latency_us_t rq_lat;
+    latency_ns_t lowest_lat = LATENCY_US_T_MAX;
+    latency_ns_t rq_lat;
 
     assert_spin_locked(&k2d->lock);
 
@@ -779,8 +800,8 @@ static inline bool k2_does_request_fit(struct k2_data* k2d, struct request* rq) 
     bool does_fit;
 
     // Do not deadlock when request time exceeds maximum inflight latency
-    if (k2d->inflight == 0) {
-        K2_LOG(printk(KERN_INFO "k2: Queue is empty, Request dispatch accepted!"));
+    if (k2d->inflight < K2_MINIMUM_COHERENT_REQUEST_COUNT) {
+        K2_LOG(printk(KERN_INFO "k2: Queue length is lower than throttling threshold, request dispatch accepted!"));
         return true;
     }
 
@@ -800,7 +821,7 @@ static inline bool k2_does_request_fit(struct k2_data* k2d, struct request* rq) 
     return does_fit;
 }
 
-static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_us_t interval) {
+static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_ns_t interval) {
     struct k2_dynamic_rt_rq* rq;
     struct list_head* list_elem;
     unsigned long flags;
@@ -1041,7 +1062,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 		struct request *rq;
 		int    prio_class;
 		int    prio_value;
-        latency_us_t rq_lat;
+        latency_ns_t rq_lat;
         pid_t pid;
         struct list_head* list_item;
         struct k2_dynamic_rt_rq* rt_rqs;
@@ -1311,9 +1332,9 @@ static void k2_completed_request(struct request *rq, u64 watDis)
 {
     struct k2_data *k2d = rq->q->elevator->elevator_data;
     unsigned long flags;
-    latency_us_t current_lat;
-    latency_us_t max_lat;
-    latency_us_t lowest_upcoming_lat;
+    latency_ns_t current_lat;
+    latency_ns_t max_lat;
+    latency_ns_t lowest_upcoming_lat;
     u64 real_latency = ktime_get_ns() - rq->io_start_time_ns;
 
     trace_k2_completed_request(rq, real_latency);
@@ -1339,7 +1360,8 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     * Rerunning the hw queues have to be done manually since we throttle
     * request dispatching. Mind that this has to be executed in async mode.
     */
-    if (current_lat < max_lat && max_lat - current_lat >= lowest_upcoming_lat) {
+    // TODO: Use request fits method
+    if (current_lat < max_lat && ktime_sub(max_lat, current_lat) >= lowest_upcoming_lat) {
         blk_mq_run_hw_queues(rq->q, true);
     }
 }
