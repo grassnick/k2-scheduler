@@ -16,19 +16,21 @@ TRACE_EVENT(k2_completed_request,
 
         TP_STRUCT__entry(
             __field(u32, request_size)
-            __field(u32, estimated_latency)
+            __field(u64, estimated_latency)
             __field(u64, real_latency)
+            __field(s32, pid)
         ),
 
         TP_fast_assign(
             // Request size is decremented once processing has progressed and is no longer valid when checked at request completion
             //__entry->request_size = blk_rq_bytes(rq);
-            __entry->request_size = (uintptr_t)rq->elv.priv[1];
+            __entry->request_size = (u32)((u64)rq->elv.priv[1] >> 32);
             __entry->estimated_latency = (uintptr_t)rq->elv.priv[0];
             __entry->real_latency = real_latency;
+            __entry->pid = (s32)rq->elv.priv[1];
         ),
 
-        TP_printk("%u,%u,%llu",
+        TP_printk("%u,%llu,%llu",
             __entry->request_size,
             __entry->estimated_latency,
             __entry->real_latency

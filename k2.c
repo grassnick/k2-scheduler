@@ -670,10 +670,13 @@ static latency_ns_t k2_expected_request_latency(struct k2_data* k2d, struct requ
  * @details For assigning additional data to each request, the kernel offers certain pointers in the request struct.
  * Apply some magic casting and be done with it.
  * */
-static inline void k2_set_rq_latency(struct request* rq, latency_ns_t rq_lat)
+static inline void k2_set_rq_data(struct request* rq, latency_ns_t rq_lat, pid_t pid)
 {
     rq->elv.priv[0] = (void*)(latency_ns_t)rq_lat;
-    rq->elv.priv[1] = (void*)(latency_ns_t)blk_rq_bytes(rq);
+
+    // As pointer sizes are expected to be 64 bit wide, we can use it to store 2 32 bit values:
+    // The request_size and the request pid
+    rq->elv.priv[1] = (void*)((u64)blk_rq_bytes(rq) << 32 | (s32) pid);
 }
 
 /**
@@ -683,7 +686,17 @@ static inline void k2_set_rq_latency(struct request* rq, latency_ns_t rq_lat)
  * */
 static inline latency_ns_t k2_get_rq_latency(struct request* rq)
 {
-    return (uintptr_t)rq->elv.priv[0];
+    return (latency_ns_t)rq->elv.priv[0];
+}
+
+static inline u32 k2_get_rq_bytes(struct request* rq)
+{
+    return (u32)((u64)rq->elv.priv[1] >> 32);
+}
+
+static inline u32 k2_get_rq_pid(struct request* rq)
+{
+    return (s32)rq->elv.priv[1];
 }
 
 /**
@@ -1088,16 +1101,17 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 		}
 
         // Set the estimated processing time for this process
+        pid = current->pid;
         rq_lat = k2_expected_request_latency(k2d, rq);
-        k2_set_rq_latency(rq, rq_lat);
+        k2_set_rq_data(rq, rq_lat, pid);
 
         // If there exists a dynamic realtime queue for this task, add the request there
-        pid = current->pid;
         if (!list_empty(&k2d->rt_dynamic_rqs)) {
             list_for_each(list_item, &k2d->rt_dynamic_rqs) {
                 rt_rqs = list_entry(list_item, struct k2_dynamic_rt_rq, list);
                 if (rt_rqs->pid == pid) {
-                    K2_LOG(printk(KERN_INFO "k2: Insert request %pK to dynamic queue for pid %d \n", rq, pid));
+                    K2_LOG(printk(KERN_INFO "k2: Insert request %pK to dynamic queue for pid %d and size %u\n"
+                                  , rq, pid,blk_rq_bytes(rq)));
                     // Update the priority class of the dynamic queue
                     rt_rqs->prio_class = prio_class;
                     rt_rqs->prio_lvl = prio_value;
@@ -1322,7 +1336,7 @@ static void k2_requests_merged(struct request_queue *q, struct request *rq,
     // TODO: How to handle inflight latency here? Is it necessary?
 
 	k2_remove_request(q, next);
-    k2_set_rq_latency(rq, k2_expected_request_latency(k2d, rq));
+    k2_set_rq_data(rq, k2_expected_request_latency(k2d, rq), k2_get_rq_pid(rq));
     k2_update_lowest_pending_latency(k2d);
 
     spin_unlock_irqrestore(&k2d->lock, flags);
@@ -1336,6 +1350,9 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     latency_ns_t max_lat;
     latency_ns_t lowest_upcoming_lat;
     u64 real_latency = ktime_get_ns() - rq->io_start_time_ns;
+
+    K2_LOG(printk(KERN_INFO "k2: Completed request for process with PID %d and request size %u\n"
+           , k2_get_rq_pid(rq), k2_get_rq_bytes(rq));)
 
     trace_k2_completed_request(rq, real_latency);
 
