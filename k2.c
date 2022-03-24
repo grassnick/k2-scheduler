@@ -52,7 +52,11 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(k2_completed_request);
 
 /** A type that represents the latency of a request */
 typedef ktime_t latency_ns_t;
-#define LATENCY_US_T_MAX KTIME_MAX
+#define LATENCY_NS_T_MAX KTIME_MAX
+
+/** A type that represents a point in time */
+typedef ktime_t timepoint_ns_t;
+#define TIMEPOINT_NS_T_MAX KTIME_MAX
 
 /** The number of requests that can always be in flight, needs to be > 0, else scheduler might stall */
 #define K2_MINIMUM_COHERENT_REQUEST_COUNT 2
@@ -72,6 +76,8 @@ static_assert(K2_MINIMUM_COHERENT_REQUEST_COUNT > 0);
 #define K2_512 512
 #define K2_32K 32 << 10
 #define K2_2048K 2 << 20
+
+#define k2_now() ktime_get_ns()
 
 extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
 		struct request **merged_request);
@@ -179,6 +185,17 @@ struct k2_dynamic_rt_rq {
      * @brief The interval, these requests will occur
      */
      latency_ns_t interval;
+
+     /**
+      * @brief Time point of the next expected occurrence of this request
+      */
+     timepoint_ns_t next_deadline;
+
+     /**
+      * @brief The latency introduced by the latest request issued by this task
+      * @details The scheduler expects periodic realtime tasks to issue requests of the same processing time.
+      */
+     latency_ns_t last_request_latency;
 
     /**
      * @brief The list of requests that are part of this request queue
@@ -561,11 +578,13 @@ static bool _k2_has_work(struct k2_data *k2d)
     assert_spin_locked(&k2d->lock);
 
 
+    // If either the limit of concurrent request latencies is reached and there are no more "free" requests left, abort
     if (k2d->max_inflight_latency - k2d->current_inflight_latency < k2d->lowest_upcoming_latency
         && k2d->inflight > K2_MINIMUM_COHERENT_REQUEST_COUNT) {
         return(false);
     }
 
+    // Check all software queues
     if (! list_empty(&k2d->be_reqs)) {
         return (true);
     }
@@ -584,6 +603,7 @@ static bool _k2_has_work(struct k2_data *k2d)
             }
         }
     }
+
     return(false);
 }
 
@@ -764,7 +784,7 @@ static void k2_update_lowest_pending_latency(struct k2_data* k2d)
     struct request* rq;
     struct list_head* list_item;
     struct k2_dynamic_rt_rq* rt_rqs;
-    latency_ns_t lowest_lat = LATENCY_US_T_MAX;
+    latency_ns_t lowest_lat = LATENCY_NS_T_MAX;
     latency_ns_t rq_lat;
 
     assert_spin_locked(&k2d->lock);
@@ -834,6 +854,26 @@ static inline bool k2_does_request_fit(struct k2_data* k2d, struct request* rq) 
     return does_fit;
 }
 
+static inline bool k2_does_request_fit2(struct k2_data* k2d, struct request* rq, struct k2_dynamic_rt_rq* rt_rqs) {
+    // Check for regular constraints
+    if (k2_does_request_fit(k2d, rq)) {
+        if (NULL == rt_rqs) {
+            // There are no rt queues
+            return true;
+        }
+        if (k2_get_rq_latency(rq) + k2_now() <= rt_rqs->next_deadline) {
+            // The new request will be completed before the next deadline
+            return true;
+        }
+        if (k2_get_rq_latency(rq) + rt_rqs->last_request_latency <= k2d->max_inflight_latency) {
+            // The overhead introduced by the new request does not interfere performance goals registered realtime tasks
+            return true;
+
+        }
+    }
+    return false;
+}
+
 static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_ns_t interval) {
     struct k2_dynamic_rt_rq* rq;
     struct list_head* list_elem;
@@ -866,8 +906,13 @@ static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_ns_t int
     INIT_LIST_HEAD(&rq->reqs);
     rq->pid = pid;
     rq->interval = interval;
+    // After registration, there is no synchronisation between requests, this first occurs, when the first actual request occurs
+    rq->next_deadline = TIMEPOINT_NS_T_MAX;
+    // After registration, there is no knowledge of the introduced latency by the request, this is set after the first request has completed
+    rq->last_request_latency = 0;
 
     // Assume default best effort scheduling class
+    // This will be set correctly when the first request is inserted in the scheduler
     rq->prio_class = IOPRIO_CLASS_BE;
     rq->prio_lvl = IOPRIO_BE_NORM;
 
@@ -993,7 +1038,7 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 	k2d->inflight     =  0;
     k2d->current_inflight_latency = 0;
     k2d->max_inflight_latency = K2_MAX_INFLIGHT_USECONDS;
-    k2d->lowest_upcoming_latency = LATENCY_US_T_MAX;
+    k2d->lowest_upcoming_latency = LATENCY_NS_T_MAX;
 	for (i = 0; i < IOPRIO_BE_NR; i++)
 		INIT_LIST_HEAD(&k2d->rt_reqs[i]);
 
@@ -1115,6 +1160,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
                     // Update the priority class of the dynamic queue
                     rt_rqs->prio_class = prio_class;
                     rt_rqs->prio_lvl = prio_value;
+                    rt_rqs->next_deadline = ktime_add(k2_now(), rt_rqs->interval);
                     list_add_tail(&rq->queuelist, &rt_rqs->reqs);
                     skip = true;
                     break;
@@ -1154,7 +1200,8 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
     struct k2_dynamic_rt_rq* rt_rqs;
 	unsigned long flags;
 	unsigned int  i;
-    int pid;
+    struct k2_dynamic_rt_rq* next_rt_rqs = NULL;
+    K2_LOG(int pid);
 
 	spin_lock_irqsave(&k2d->lock, flags);
 
@@ -1172,6 +1219,14 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
     if (!list_empty(&k2d->rt_dynamic_rqs)) {
         list_for_each(list_elem, &k2d->rt_dynamic_rqs) {
             rt_rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
+            // Get the next deadline of any rt queues
+            if (NULL != next_rt_rqs) {
+                if (next_rt_rqs->next_deadline < rt_rqs->next_deadline) {
+                    next_rt_rqs = rt_rqs;
+                }
+            } else {
+                next_rt_rqs = rt_rqs;
+            }
             // As of k2_insert_request(), there are only BE or RT classes in use here, so this check is valid,
             // as long as the enum declaration order in the kernel header (ioprio.h) is constant
             // (IOPRIO_CLASS_RT,
@@ -1180,7 +1235,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
                 if (rt_rqs->prio_class <= highest_rt_rq_class) {
                     if (rt_rqs->prio_lvl < highest_rt_rq_lvl) {
                         K2_LOG(printk(KERN_INFO "k2: Select new highest prio dynamic dispatch request %pK\n", rq));
-                        pid = rt_rqs->pid;
+                        K2_LOG(pid = rt_rqs->pid);
                         rq = list_first_entry(&rt_rqs->reqs, struct request, queuelist);
                         highest_prio_rt_rq = rq;
                         highest_rt_rq_class = rt_rqs->prio_class;
@@ -1236,7 +1291,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 
 end:
     K2_LOG(printk(KERN_INFO "k2: Try Dispatch request %pK\n",rq));
-    if (!k2_does_request_fit(k2d, rq)) {
+    if (!k2_does_request_fit2(k2d, rq, next_rt_rqs)) {
         goto abort;
     }
     K2_LOG(printk(KERN_INFO "k2: Dispatch request %pK\n",rq));
@@ -1349,7 +1404,9 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     latency_ns_t current_lat;
     latency_ns_t max_lat;
     latency_ns_t lowest_upcoming_lat;
-    u64 real_latency = ktime_get_ns() - rq->io_start_time_ns;
+    latency_ns_t real_latency = k2_now() - rq->io_start_time_ns;
+    struct list_head* list_elem;
+    struct k2_dynamic_rt_rq* rt_rqs;
 
     K2_LOG(printk(KERN_INFO "k2: Completed request for process with PID %d and request size %u\n"
            , k2_get_rq_pid(rq), k2_get_rq_bytes(rq));)
@@ -1368,7 +1425,16 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     max_lat = k2d->max_inflight_latency;
     lowest_upcoming_lat = k2d->lowest_upcoming_latency;
 
-
+    // If the request was delivered by a dynamic realtime queue, update their processing time
+    if (!list_empty(&k2d->rt_dynamic_rqs)) {
+        list_for_each(list_elem, &k2d->rt_dynamic_rqs) {
+            rt_rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
+            if (rt_rqs->pid == k2_get_rq_pid(rq)) {
+                rt_rqs->last_request_latency = real_latency;
+                break;
+            }
+        }
+    }
 
     spin_unlock_irqrestore(&k2d->lock, flags);
 
