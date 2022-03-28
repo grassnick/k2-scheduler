@@ -186,7 +186,7 @@ struct k2_dynamic_rt_rq {
      */
      latency_ns_t interval;
 
-     /**
+      /**
       * @brief Time point of the next expected occurrence of this request
       */
      timepoint_ns_t next_deadline;
@@ -911,7 +911,7 @@ static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_ns_t int
     // After registration, there is no knowledge of the introduced latency by the request, this is set after the first request has completed
     rq->last_request_latency = 0;
 
-    // Assume default best effort scheduling class
+    // Assume the default best effort scheduling class
     // This will be set correctly when the first request is inserted in the scheduler
     rq->prio_class = IOPRIO_CLASS_BE;
     rq->prio_lvl = IOPRIO_BE_NORM;
@@ -1139,6 +1139,10 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 
         // Add request to the rb tree of request for merge-checking
 		k2_add_rq_rb(k2d, rq);
+        // Add to generic elevator hash table for request merging
+        // Why do both? -
+        //  * internal scheduler hash table supports back merges
+        //  * the elevator internal rb tree supports front merges
 		if (rq_mergeable(rq)) {
 			elv_rqhash_add(q, rq);
 			if (!q->last_merge)
@@ -1161,7 +1165,11 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
                     rt_rqs->prio_class = prio_class;
                     rt_rqs->prio_lvl = prio_value;
                     rt_rqs->next_deadline = ktime_add(k2_now(), rt_rqs->interval);
+
+                    // Enable the next statement to disable any merging attempts for dynamic rt requests
+                    //rq->cmd_flags |= REQ_NOMERGE;
                     list_add_tail(&rq->queuelist, &rt_rqs->reqs);
+
                     skip = true;
                     break;
                 }
@@ -1314,18 +1322,72 @@ abort:
     return(NULL);
 }
 
-static bool k2_bio_merge(struct request_queue *q, struct bio *bio, unsigned int watdis)
+/**
+ * @brief Decide, weather a new bio is allowed to merged to one of the existing requests
+ * @detals Called from within blk_bio_list_merge(), if no merge_bio() callback is registered; and blk_mq_sched_try_merge()
+ * @param q The software queue this bio belongs to
+ * @param rq The request to merge the bio with
+ * @param bio The bio to merge
+ * @return If the bio is allowed to be merged generically by the block layer
+ */
+bool k2_allow_merge(struct request_queue *q, struct request *rq, struct bio *bio)
+{
+    struct k2_data *k2d = q->elevator->elevator_data;
+    unsigned long flags;
+    int ret = true;
+    struct list_head* list_elem;
+    struct k2_dynamic_rt_rq* rt_rqs;
+    pid_t pid_cur = current->pid;
+    pid_t pid_req = k2_get_rq_pid(rq);
+
+    // If the request comes from the same process, allow merging
+    if (pid_cur == pid_req) {
+        ret = true;
+        goto ret;
+    }
+
+    // Do not allow for registered realtime requests to get merged with a request from any other task
+    spin_lock_irqsave(&k2d->lock, flags);
+    if (!list_empty(&k2d->rt_dynamic_rqs)) {
+        list_for_each(list_elem, &k2d->rt_dynamic_rqs) {
+            rt_rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
+            if (pid_cur == rt_rqs->pid || pid_req == rt_rqs->pid) {
+                ret = false;
+                goto finally;
+            }
+        }
+    }
+
+    finally:
+    spin_unlock_irqrestore(&k2d->lock, flags);
+    ret:
+    K2_LOG(printk(KERN_WARNING "k2: k2_allow_merge: %d , req: %d, with new bio pid %d\n", ret, pid_req, pid_cur));
+
+    return ret;
+}
+
+/**
+ * @brief Check for a bio, if it can be merged with any outstanding requests in the elevator queues
+ * @details Called from within submit_bio(), whenever a new bio arrives (some constraints apply before)
+ * @param q The software queue this bio belongs to
+ * @param bio The new bio
+ * @param nr_segments The count of bio segments
+ * @return True, if there was a merge, else false
+ */
+static bool k2_bio_merge(struct request_queue *q, struct bio *bio, unsigned int nr_segments)
 {
 	struct k2_data *k2d = q->elevator->elevator_data;
 	struct request *free = NULL;
 	unsigned long flags;
 	bool ret;
 
-    K2_LOG(printk(KERN_INFO "k2: Entering k2_bio_merge"));
+    K2_LOG(printk(KERN_INFO "k2: Entering k2_bio_merge\n"));
 
 	spin_lock_irqsave(&k2d->lock, flags);
 	ret = blk_mq_sched_try_merge(q, bio, &free);
 	spin_unlock_irqrestore(&k2d->lock, flags);
+
+    K2_LOG(if (ret) printk(KERN_INFO "k2: k2_bio_merge: Performed a merge\n");)
 
 	if (free)
 		blk_mq_free_request(free);
@@ -1333,6 +1395,17 @@ static bool k2_bio_merge(struct request_queue *q, struct bio *bio, unsigned int 
 	return(ret);
 }
 
+/**
+ * @brief Try to find a merge candidate for a new bio with a request in the current software queues
+ * @details Called from within blk_mq_sched_try_merge() (this is called from k2_bio_merge()).
+ *  If the merge was successful, k2_request_merged() is called.
+ *  This custom implementation by Weisbach uses a rb tree to store every request in the
+ *  software queues for front merge checking.
+ * @param q The software queue this bio belongs to
+ * @param rq Return parameter: The request this bio was merged with, else NULL
+ * @param bio The new bio
+ * @return The status code of the operation (enum elv_merge)
+ */
 static int k2_request_merge(struct request_queue *q, struct request **rq,
 				struct bio *bio)
 {
@@ -1340,7 +1413,8 @@ static int k2_request_merge(struct request_queue *q, struct request **rq,
 	struct request *__rq;
 	sector_t sector = bio_end_sector(bio);
 
-    K2_LOG(printk(KERN_INFO "k2: Entering k2_request_merge"));
+    K2_LOG(printk(KERN_INFO "k2: Entering k2_request_merge\n"));
+
 	assert_spin_locked(&k2d->lock);
 
 	// should request merging cross I/O prios?
@@ -1349,8 +1423,10 @@ static int k2_request_merge(struct request_queue *q, struct request **rq,
 	if (__rq) {
 		BUG_ON(sector != blk_rq_pos(__rq));
 
+        // Checks k2_allow_merge
 		if (elv_bio_merge_ok(__rq, bio)) {
 			*rq = __rq;
+            K2_LOG(printk(KERN_ERR "k2 Did a request front merge\n"));
 			return(ELEVATOR_FRONT_MERGE);
 		}
 	}
@@ -1358,12 +1434,18 @@ static int k2_request_merge(struct request_queue *q, struct request **rq,
 	return(ELEVATOR_NO_MERGE);
 }
 
+/**
+ * @brief Invoked after a bio was successfully merged into a existing request
+ * @param q The software queue of the request
+ * @param rq The request that was merged
+ * @param type The type of the merge
+ */
 static void k2_request_merged(struct request_queue *q, struct request *rq,
 				enum elv_merge type)
 {
 	struct k2_data *k2d = q->elevator->elevator_data;
 
-    K2_LOG(printk(KERN_INFO "k2: Entering k2_request_merged"));
+    K2_LOG(printk(KERN_ERR "k2: Entering k2_request_merged\n"));
 
 	/*
 	 * if the merge was a front merge, we need to reposition request
@@ -1374,9 +1456,12 @@ static void k2_request_merged(struct request_queue *q, struct request *rq,
 	}
 }
 
-/*
- * This function is called to notify the scheduler that the requests
- * rq and 'next' have been merged, with 'next' going away.
+/**
+ * @brief Invoked whenever a request was merged with another request
+ * @details
+ * @param q The software queue of the existing request
+ * @param rq The request that the other request was merged with
+ * @param next The new request that was merged. This object is no longer valid.
  */
 static void k2_requests_merged(struct request_queue *q, struct request *rq,
 				struct request *next)
@@ -1408,8 +1493,8 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     struct list_head* list_elem;
     struct k2_dynamic_rt_rq* rt_rqs;
 
-    K2_LOG(printk(KERN_INFO "k2: Completed request for process with PID %d and request size %u\n"
-           , k2_get_rq_pid(rq), k2_get_rq_bytes(rq));)
+    K2_LOG(printk(KERN_INFO "k2: Completed request %pK for process with PID %d and request size %u, sectors %d\n"
+           ,rq,  k2_get_rq_pid(rq), k2_get_rq_bytes(rq), blk_rq_stats_sectors(rq)));
 
     trace_k2_completed_request(rq, real_latency);
 
@@ -1459,9 +1544,12 @@ static struct elevator_type k2_iosched = {
 		.dispatch_request  = k2_dispatch_request,
 		.completed_request = k2_completed_request,
 
+        .allow_merge       = k2_allow_merge,
         .bio_merge         = k2_bio_merge,
 		.request_merge     = k2_request_merge,
 		.request_merged    = k2_request_merged,
+        .next_request		= elv_rb_latter_request,
+        .former_request		= elv_rb_former_request,
 		.requests_merged   = k2_requests_merged,
 	},
 	.elevator_attrs = k2_attrs,
