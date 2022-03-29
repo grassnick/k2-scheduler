@@ -861,6 +861,11 @@ static inline bool k2_does_request_fit2(struct k2_data* k2d, struct request* rq,
             // There are no rt queues
             return true;
         }
+
+        if (list_empty(&rt_rqs->reqs)) {
+            return true;
+        }
+
         if (k2_get_rq_latency(rq) + k2_now() <= rt_rqs->next_deadline) {
             // The new request will be completed before the next deadline
             return true;
@@ -1270,12 +1275,12 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
                     // The dynamic request queue has a higher priority level, dispatch it
                     K2_LOG(printk(KERN_INFO "k2: Select Dispatch request dynamic rt %pK, pid %d\n", rq, pid));
                     rq = highest_prio_rt_rq;
-                    goto end;
+                    goto dynamic_end;
                 }
             } else {
                 K2_LOG(printk(KERN_INFO "k2: Select Dispatch request static rt %pK\n, no dynamic rt class requests available", rq));
                 // The highest priority class in dynamic queues is BE, schedule the first static RT request available
-                goto end;
+                goto dynamic_end;
             }
 		}
 	}
@@ -1285,7 +1290,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
     if (NULL != highest_prio_rt_rq) {
         K2_LOG(printk(KERN_INFO "k2: Select Dispatch request dynamic be %pK, pid %d\n",rq, pid));
         rq = highest_prio_rt_rq;
-        goto end;
+        goto dynamic_end;
     }
 
 	/* no rt rqs waiting: choose other workload */
@@ -1303,6 +1308,7 @@ end:
         goto abort;
     }
     K2_LOG(printk(KERN_INFO "k2: Dispatch request %pK\n",rq));
+dynamic_end:
 	k2_remove_request(q, rq);
     k2_add_latency(k2d, rq);
     rq->rq_flags |= RQF_STARTED;
