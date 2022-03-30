@@ -63,6 +63,12 @@ typedef ktime_t timepoint_ns_t;
 static_assert(K2_MINIMUM_COHERENT_REQUEST_COUNT > 0);
 static_assert(K2_MINIMUM_COHERENT_REQUEST_COUNT < U64_MAX);
 
+#define K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT 8U
+static_assert(K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT > 0);
+static_assert(K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT < U16_MAX);
+
+
+
 /** The initial value for the maximum in-flight latency */
 #define K2_MAX_INFLIGHT_USECONDS 62490 * 4
 
@@ -716,9 +722,24 @@ static inline u32 k2_get_rq_bytes(struct request* rq)
     return (u32)rq->stats_sectors >> SECTOR_SHIFT;
 }
 
+static inline u16 k2_get_rq_schedule_attempts_rt_constraint(struct request* rq) {
+    return (u16)((u64)rq->elv.priv[1] >> 48);
+}
+
 static inline pid_t k2_get_rq_pid(struct request* rq)
 {
     return (pid_t)rq->elv.priv[1];
+}
+
+
+static inline void k2_set_rq_attempts_rt_constrain(struct request* rq, u16 new)
+{
+    rq->elv.priv[1] = (void*)(((u64)rq->elv.priv[1] & 0xFFFFFFF0LL) | (((u64) new) << 48));
+}
+
+static inline void k2_increment_rq_attempts_rt_constrain(struct request* rq) {
+    u16 cur = k2_get_rq_schedule_attempts_rt_constraint(rq);
+    k2_set_rq_attempts_rt_constrain(rq, cur + 1);
 }
 
 /**
@@ -829,7 +850,7 @@ static void k2_update_lowest_pending_latency(struct k2_data* k2d)
 }
 
 /**
- * @brief Determine, weather a request can currently be dispatched with respect to the scheduling limitations
+ * @brief Determine, weather a request can currently be dispatched with respect to the global scheduling limitations
  */
 static inline bool k2_does_request_fit(struct k2_data* k2d, struct request* rq) {
     bool does_fit;
@@ -856,6 +877,9 @@ static inline bool k2_does_request_fit(struct k2_data* k2d, struct request* rq) 
     return does_fit;
 }
 
+/**
+ * @brief Determine if a request can be dispatched with respect to the next upcoming registered realtime task and global scheduling decisions
+ */
 static inline bool k2_does_request_fit2(struct k2_data* k2d, struct request* rq, struct k2_dynamic_rt_rq* rt_rqs) {
     // Check for regular constraints
     if (k2_does_request_fit(k2d, rq)) {
@@ -864,9 +888,7 @@ static inline bool k2_does_request_fit2(struct k2_data* k2d, struct request* rq,
             return true;
         }
 
-        if (list_empty(&rt_rqs->reqs)) {
-            return true;
-        }
+
 
         if (k2_get_rq_latency(rq) + k2_now() <= rt_rqs->next_deadline) {
             // The new request will be completed before the next deadline
@@ -876,6 +898,23 @@ static inline bool k2_does_request_fit2(struct k2_data* k2d, struct request* rq,
             // The overhead introduced by the new request does not interfere performance goals registered realtime tasks
             return true;
 
+        }
+
+        // The following code snipped was a quick workaround, where normal, non registered low prio
+        // requests would lead to a stall of the processing kernel thread, as they would never be scheduled,
+        // When their estimated processing time would exceed the next deadline constraint of a registered task
+        // even when there were no outstanding requests
+#if false
+        if (list_empty(&rt_rqs->reqs)) {
+            return true;
+        }
+#endif
+        // The new solution is to define a maximum number of retires for a request
+        if (k2_get_rq_schedule_attempts_rt_constraint(rq) < K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT) {
+            k2_increment_rq_attempts_rt_constrain(rq);
+            return false;
+        } else {
+            return true;
         }
     }
     return false;
@@ -1490,6 +1529,8 @@ static void k2_requests_merged(struct request_queue *q, struct request *rq,
 
 	k2_remove_request(q, next);
     k2_set_rq_data(rq, k2_expected_request_latency(k2d, rq), k2_get_rq_pid(rq));
+    k2_set_rq_attempts_rt_constrain(rq, min(k2_get_rq_schedule_attempts_rt_constraint(rq),
+                                            k2_get_rq_schedule_attempts_rt_constraint(next)));
     k2_update_lowest_pending_latency(k2d);
 
     spin_unlock_irqrestore(&k2d->lock, flags);
