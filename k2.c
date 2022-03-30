@@ -1128,8 +1128,8 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
         latency_ns_t rq_lat;
         pid_t pid;
         struct list_head* list_item;
+        struct list_head* k2_queue;
         struct k2_dynamic_rt_rq* rt_rqs;
-        int skip = false;
 
         rq = list_first_entry(rqs, struct request, queuelist);
 		list_del_init(&rq->queuelist);
@@ -1173,15 +1173,12 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 
                     // Enable the next statement to disable any merging attempts for dynamic rt requests
                     //rq->cmd_flags |= REQ_NOMERGE;
-                    list_add_tail(&rq->queuelist, &rt_rqs->reqs);
 
-                    skip = true;
-                    break;
+
+                    k2_queue = &rt_rqs->reqs;
+                    goto insert_request;
                 }
             }
-        }
-        if (skip) {
-            continue;
         }
 
         // Else add it to regular queues
@@ -1190,11 +1187,17 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
                 prio_value = IOPRIO_NORM;
             }
             K2_LOG(printk(KERN_INFO "k2: Insert request %pK to static rt queue %d for pid %d \n", rq, prio_value , pid));
-			list_add_tail(&rq->queuelist, &k2d->rt_reqs[prio_value]);
+            k2_queue = &k2d->rt_reqs[prio_value];
 		} else {
             K2_LOG(printk(KERN_INFO "k2: Insert request %pK to static be queue for pid %d \n", rq, pid));
-			list_add_tail(&rq->queuelist, &k2d->be_reqs);
+            k2_queue = &k2d->be_reqs;
 		}
+
+        insert_request:
+        // As of the documentation, this should be called "immediately before block operation request @rq is inserted
+        // into queue @q"
+        trace_block_rq_insert(rq);
+        list_add_tail(&rq->queuelist, k2_queue);
 	}
     // TODO: Inline this functionality to the iterations already done in this function
     k2_update_lowest_pending_latency(k2d);
