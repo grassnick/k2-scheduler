@@ -695,8 +695,9 @@ static inline void k2_set_rq_data(struct request* rq, latency_ns_t rq_lat, pid_t
     rq->elv.priv[0] = (void*)(latency_ns_t)rq_lat;
 
     // As pointer sizes are expected to be 64 bit wide, we can use it to store 2 32 bit values:
-    // The request_size and the request pid
-    rq->elv.priv[1] = (void*)((u64)blk_rq_bytes(rq) << 32 | (s32) pid);
+    // The pid, and later on, the number of attempts to schedule the request
+    // 16 RTC Attempts | 16 Reserved | 32 PID
+    rq->elv.priv[1] = (void*)((u64) NULL | (s32) pid);
 }
 
 /**
@@ -711,7 +712,7 @@ static inline latency_ns_t k2_get_rq_latency(struct request* rq)
 
 static inline u32 k2_get_rq_bytes(struct request* rq)
 {
-    return (u32)((u64)rq->elv.priv[1] >> 32);
+    return (u32)rq->stats_sectors >> SECTOR_SHIFT;
 }
 
 static inline pid_t k2_get_rq_pid(struct request* rq)
