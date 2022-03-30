@@ -1361,7 +1361,6 @@ bool k2_allow_merge(struct request_queue *q, struct request *rq, struct bio *bio
     // When called by this function, things might get ugly
     assert_spin_locked(&k2d->lock);
     // Do not allow for registered realtime requests to get merged with a request from any other task
-    spin_lock_irqsave(&k2d->lock, flags);
     if (!list_empty(&k2d->rt_dynamic_rqs)) {
         list_for_each(list_elem, &k2d->rt_dynamic_rqs) {
             rt_rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
@@ -1373,7 +1372,6 @@ bool k2_allow_merge(struct request_queue *q, struct request *rq, struct bio *bio
     }
 
     finally:
-    spin_unlock_irqrestore(&k2d->lock, flags);
     ret:
     K2_LOG(printk(KERN_WARNING "k2: k2_allow_merge: %d , req: %d, with new bio pid %d\n", ret, pid_req, pid_cur));
 
