@@ -89,6 +89,8 @@ static_assert(K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT < U16_MAX);
 extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
 		struct request **merged_request);
 
+K2_LOG(u16 max_retries = 0;)
+
 /* ===============================
  * ===== STRUCT DEFINITIONS ======
  * ============================ */
@@ -411,6 +413,7 @@ static long k2_dev_ioctl(struct file *file, unsigned int cmd,
                 return -ENOENT;
             }
             ret = k2_del_all_dynamic_rt_rq(k2d);
+            K2_LOG(max_retries = 0;)
             if (ret) {
                 break;
             }
@@ -722,19 +725,20 @@ static inline u32 k2_get_rq_bytes(struct request* rq)
     return (u32)rq->stats_sectors >> SECTOR_SHIFT;
 }
 
-static inline u16 k2_get_rq_schedule_attempts_rt_constraint(struct request* rq) {
-    return (u16)((u64)rq->elv.priv[1] >> 48);
-}
 
 static inline pid_t k2_get_rq_pid(struct request* rq)
 {
     return (pid_t)rq->elv.priv[1];
 }
 
+static inline u16 k2_get_rq_schedule_attempts_rt_constraint(struct request* rq) {
+    return (u16)((u64)rq->elv.priv[1] >> 48);
+}
+
 
 static inline void k2_set_rq_attempts_rt_constrain(struct request* rq, u16 new)
 {
-    rq->elv.priv[1] = (void*)(((u64)rq->elv.priv[1] & 0xFFFFFFF0LL) | (((u64) new) << 48));
+    rq->elv.priv[1] = (void*)(((u64)rq->elv.priv[1] & 0x0000FFFFFFFFFFFFLL) | (((u64) new) << 48));
 }
 
 static inline void k2_increment_rq_attempts_rt_constrain(struct request* rq) {
@@ -904,18 +908,18 @@ static inline bool k2_does_request_fit2(struct k2_data* k2d, struct request* rq,
         // requests would lead to a stall of the processing kernel thread, as they would never be scheduled,
         // When their estimated processing time would exceed the next deadline constraint of a registered task
         // even when there were no outstanding requests
-#if false
+#if 0
         if (list_empty(&rt_rqs->reqs)) {
             return true;
         }
 #endif
-        // The new solution is to define a maximum number of retires for a request
-        if (k2_get_rq_schedule_attempts_rt_constraint(rq) < K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT) {
-            k2_increment_rq_attempts_rt_constrain(rq);
-            return false;
-        } else {
+#if 1
+        // The new solution is to define a maximum number of retries for a request, that was denied because of the next rt deadline
+        if (k2_get_rq_schedule_attempts_rt_constraint(rq) >= K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT) {
             return true;
         }
+        k2_increment_rq_attempts_rt_constrain(rq);
+#endif
     }
     return false;
 }
@@ -1349,6 +1353,11 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 end:
     K2_LOG(printk(KERN_INFO "k2: Try Dispatch request %pK\n",rq));
     if (!k2_does_request_fit2(k2d, rq, next_rt_rqs)) {
+        K2_LOG(u16 val = k2_get_rq_schedule_attempts_rt_constraint(rq);
+        if (val > max_retries) {
+            max_retries = val;
+            printk(KERN_INFO "k2: Dispatch request %pK ABORTED, %u, %u, %u, %px\n", rq, val, max_retries, k2_get_rq_pid(rq), rq->elv.priv[1]);
+        })
         goto abort;
     }
     K2_LOG(printk(KERN_INFO "k2: Dispatch request %pK\n",rq));
