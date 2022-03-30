@@ -892,8 +892,6 @@ static inline bool k2_does_request_fit2(struct k2_data* k2d, struct request* rq,
             return true;
         }
 
-
-
         if (k2_get_rq_latency(rq) + k2_now() <= rt_rqs->next_deadline) {
             // The new request will be completed before the next deadline
             return true;
@@ -901,7 +899,6 @@ static inline bool k2_does_request_fit2(struct k2_data* k2d, struct request* rq,
         if (k2_get_rq_latency(rq) + rt_rqs->last_request_latency <= k2d->max_inflight_latency) {
             // The overhead introduced by the new request does not interfere performance goals registered realtime tasks
             return true;
-
         }
 
         // The following code snipped was a quick workaround, where normal, non registered low prio
@@ -1392,7 +1389,6 @@ abort:
 bool k2_allow_merge(struct request_queue *q, struct request *rq, struct bio *bio)
 {
     struct k2_data *k2d = q->elevator->elevator_data;
-    unsigned long flags;
     int ret = true;
     struct list_head* list_elem;
     struct k2_dynamic_rt_rq* rt_rqs;
