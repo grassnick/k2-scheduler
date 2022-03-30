@@ -59,8 +59,9 @@ typedef ktime_t timepoint_ns_t;
 #define TIMEPOINT_NS_T_MAX KTIME_MAX
 
 /** The number of requests that can always be in flight, needs to be > 0, else scheduler might stall */
-#define K2_MINIMUM_COHERENT_REQUEST_COUNT 2
+#define K2_MINIMUM_COHERENT_REQUEST_COUNT 2U
 static_assert(K2_MINIMUM_COHERENT_REQUEST_COUNT > 0);
+static_assert(K2_MINIMUM_COHERENT_REQUEST_COUNT < U64_MAX);
 
 /** The initial value for the maximum in-flight latency */
 #define K2_MAX_INFLIGHT_USECONDS 62490 * 4
