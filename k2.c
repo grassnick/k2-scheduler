@@ -1355,6 +1355,10 @@ bool k2_allow_merge(struct request_queue *q, struct request *rq, struct bio *bio
         goto ret;
     }
 
+    // This lock should be set by the invoking k2_bio_merge
+    // However this function is called by blk_attempt_plug_merge() in submit_bio() as well.
+    // When called by this function, things might get ugly
+    assert_spin_locked(&k2d->lock);
     // Do not allow for registered realtime requests to get merged with a request from any other task
     spin_lock_irqsave(&k2d->lock, flags);
     if (!list_empty(&k2d->rt_dynamic_rqs)) {
