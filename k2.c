@@ -714,9 +714,9 @@ static inline u32 k2_get_rq_bytes(struct request* rq)
     return (u32)((u64)rq->elv.priv[1] >> 32);
 }
 
-static inline u32 k2_get_rq_pid(struct request* rq)
+static inline pid_t k2_get_rq_pid(struct request* rq)
 {
-    return (s32)rq->elv.priv[1];
+    return (pid_t)rq->elv.priv[1];
 }
 
 /**
