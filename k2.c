@@ -1534,8 +1534,7 @@ static void k2_requests_merged(struct request_queue *q, struct request *rq,
 
 	k2_remove_request(q, next);
     k2_set_rq_data(rq, k2_expected_request_latency(k2d, rq), k2_get_rq_pid(rq));
-    k2_set_rq_attempts_rt_constrain(rq, min(k2_get_rq_schedule_attempts_rt_constraint(rq),
-                                            k2_get_rq_schedule_attempts_rt_constraint(next)));
+    k2_set_rq_attempts_rt_constrain(rq, max(k2_get_rq_schedule_attempts_rt_constraint(rq), k2_get_rq_schedule_attempts_rt_constraint(next)));
     k2_update_lowest_pending_latency(k2d);
 
     spin_unlock_irqrestore(&k2d->lock, flags);
