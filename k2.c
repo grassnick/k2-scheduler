@@ -722,7 +722,7 @@ static inline latency_ns_t k2_get_rq_latency(struct request* rq)
 
 static inline u32 k2_get_rq_bytes(struct request* rq)
 {
-    return (u32)rq->stats_sectors >> SECTOR_SHIFT;
+    return (u32)rq->stats_sectors << SECTOR_SHIFT;
 }
 
 

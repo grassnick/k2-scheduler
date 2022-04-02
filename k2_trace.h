@@ -24,7 +24,7 @@ TRACE_EVENT(k2_completed_request,
         TP_fast_assign(
             // Request size is decremented once processing has progressed and is no longer valid when checked at request completion
             //__entry->request_size = blk_rq_bytes(rq);
-            __entry->request_size = (u32)rq->stats_sectors >> SECTOR_SHIFT;
+            __entry->request_size = (u32)(blk_rq_stats_sectors(rq) << SECTOR_SHIFT);
             __entry->estimated_latency = (uintptr_t)rq->elv.priv[0];
             __entry->real_latency = real_latency;
             __entry->pid = (s32)rq->elv.priv[1];
