@@ -596,11 +596,13 @@ static bool _k2_has_work(struct k2_data *k2d)
 
     // Check all software queues
     if (! list_empty(&k2d->be_reqs)) {
+        K2_LOG(printk(KERN_INFO "k2: CALL has_work software queue \n"));
         return (true);
     }
 
     for (i = 0; i < IOPRIO_BE_NR; i++) {
         if (! list_empty(&k2d->rt_reqs[i])) {
+            K2_LOG(printk(KERN_INFO "k2: CALL has_work software queue rt \n"));
             return(true);
         }
     }
@@ -609,6 +611,7 @@ static bool _k2_has_work(struct k2_data *k2d)
         list_for_each(list_elem, &k2d->rt_dynamic_rqs) {
             rt_rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
             if(!list_empty(&rt_rqs->reqs)) {
+                K2_LOG(printk(KERN_INFO "k2: CALL has_work %d dynamic rt \n", rt_rqs->pid));
                 return true;
             }
         }
@@ -1216,6 +1219,8 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
                     // Enable the next statement to disable any merging attempts for dynamic rt requests
                     //rq->cmd_flags |= REQ_NOMERGE;
 
+                    K2_LOG(printk(KERN_INFO "k2: set rt queue deadline for pid %d to %lld\n", pid, rt_rqs->next_deadline));
+                    K2_LOG(printk(KERN_WARNING "k2: Insert dyn rt REQ: size: %u (%u K), offset %llu  || BIO: how many bio bio_vecs %u \n", blk_rq_bytes(rq), blk_rq_bytes(rq) >> 10, blk_rq_pos(rq), rq->bio->bi_vcnt);)
 
                     k2_queue = &rt_rqs->reqs;
                     goto insert_request;
@@ -1261,6 +1266,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
     struct k2_dynamic_rt_rq* next_rt_rqs = NULL;
     K2_LOG(int pid);
 
+    K2_LOG(printk(KERN_INFO "k2: Entering dispatch \n"));
 	spin_lock_irqsave(&k2d->lock, flags);
 
 	/* Situation might have change since the last call to has_work() */
@@ -1357,8 +1363,8 @@ end:
         })
         goto abort;
     }
-    K2_LOG(printk(KERN_INFO "k2: Dispatch request %pK\n",rq));
 dynamic_end:
+    K2_LOG(printk(KERN_INFO "k2: Dispatch request %pK\n",rq));
 	k2_remove_request(q, rq);
     k2_add_latency(k2d, rq);
     rq->rq_flags |= RQF_STARTED;
@@ -1397,6 +1403,7 @@ bool k2_allow_merge(struct request_queue *q, struct request *rq, struct bio *bio
 
     // If the request comes from the same process, allow merging
     if (pid_cur == pid_req) {
+        K2_LOG(printk(KERN_INFO "k2: allow merge same pid\n"));
         ret = true;
         goto ret;
     }
@@ -1410,15 +1417,17 @@ bool k2_allow_merge(struct request_queue *q, struct request *rq, struct bio *bio
         list_for_each(list_elem, &k2d->rt_dynamic_rqs) {
             rt_rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
             if (pid_cur == rt_rqs->pid || pid_req == rt_rqs->pid) {
+                K2_LOG(printk(KERN_INFO "k2: allow merge NO, rt involved \n"));
                 ret = false;
                 goto finally;
             }
         }
     }
+    K2_LOG(printk(KERN_INFO "k2: allow merge , no problem\n"));
 
     finally:
     ret:
-    K2_LOG(printk(KERN_WARNING "k2: k2_allow_merge: %d , req: %d, with new bio pid %d\n", ret, pid_req, pid_cur));
+    K2_LOG(printk(KERN_INFO "k2: k2_allow_merge: %d , req: %d, with new bio pid %d\n", ret, pid_req, pid_cur));
 
     return ret;
 }
@@ -1552,7 +1561,7 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     struct k2_dynamic_rt_rq* rt_rqs;
 
     K2_LOG(printk(KERN_INFO "k2: Completed request %pK for process with PID %d and request size %u, sectors %d\n"
-           ,rq,  k2_get_rq_pid(rq), k2_get_rq_bytes(rq), blk_rq_stats_sectors(rq)));
+           ,rq, k2_get_rq_pid(rq), k2_get_rq_bytes(rq), blk_rq_stats_sectors(rq)));
 
     trace_k2_completed_request(rq, real_latency);
 
