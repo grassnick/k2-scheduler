@@ -1609,8 +1609,6 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     struct k2_dynamic_rt_rq* rt_rqs;
     unsigned inflight;
 
-    K2_LOG(printk(KERN_INFO "k2: Completed request %pK for process with PID %d and request size %u, sectors %d\n"
-           ,rq, k2_get_rq_pid(rq), k2_get_rq_bytes(rq), blk_rq_stats_sectors(rq)));
 
     spin_lock_irqsave(&k2d->lock, flags);
 
@@ -1623,6 +1621,9 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     // It is most likely a flush request, which uses the elv.priv fields for flush data.
     // Both structs are contained in the same union.
     if (k2_rq_is_managed_by_k2(rq)) {
+
+      K2_LOG(printk(KERN_INFO "k2: Completed request %pK for process with PID %d and request size %u, sectors %d\n"
+             ,rq, k2_get_rq_pid(rq), k2_get_rq_bytes(rq), blk_rq_stats_sectors(rq)));
       k2_remove_latency(k2d, rq);
       trace_k2_completed_request(rq, real_latency);
 
