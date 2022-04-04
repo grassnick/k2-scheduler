@@ -217,6 +217,16 @@ struct k2_dynamic_rt_rq {
     struct list_head list;
 };
 
+/**
+ * @brief The type of a request
+ * @details As we only treat READ and Writes, group all other request types in a separate category
+ */
+enum {
+  K2_REQ_READ,
+  K2_REQ_WRITE,
+  K2_REQ_OTHER,
+};
+
 /* ===============================
  * ===== FUNCTION PROTOTYPES =====
  * ============================ */
@@ -549,6 +559,33 @@ abort:
  * ==== K2 helper functions ====
  * ========================== */
 
+static const char *k2_req_type_names[] = {
+    [K2_REQ_READ] = "READ",
+    [K2_REQ_WRITE] = "WRITE",
+    [K2_REQ_OTHER] = "OTHER",
+};
+
+static inline unsigned int k2_req_type(struct request* rq)
+{
+  switch (req_op(rq) & REQ_OP_MASK) {
+  case REQ_OP_READ:
+    return K2_REQ_READ;
+  case REQ_OP_WRITE:
+    return K2_REQ_WRITE;
+  default:
+    return K2_REQ_OTHER;
+  }
+}
+
+/**
+ * @brief Check, if the scheduler has attached any data to the request
+ * @details This is most likely the case because the request is a flush request
+ * Do not try to read or write to attached elv data, if this is the case!
+ */
+static inline bool k2_rq_is_managed_by_k2(struct request* rq) {
+  return rq->rq_flags & RQF_ELVPRIV;
+}
+
 static inline struct rb_root *k2_rb_root(struct k2_data *k2d,
 						struct request *rq)
 {
@@ -661,9 +698,10 @@ static latency_ns_t k2_expected_request_latency(struct k2_data* k2d, struct requ
     latency_ns_t rq_lat = 0;
 
     K2_LOG(printk(KERN_INFO "k2: Request size: %u (%uk)", rq_size, rq_size / 1024));
+    unsigned type = k2_req_type(rq);
 
-    switch (rq->cmd_flags & REQ_OP_MASK) {
-        case REQ_OP_READ:
+    switch (type) {
+        case K2_REQ_READ:
             K2_LOG(printk(KERN_INFO "k2: Request is read"));
             if(rq_size <= K2_512) {
                 rq_lat = k2d->rr_512_lat;
@@ -675,7 +713,7 @@ static latency_ns_t k2_expected_request_latency(struct k2_data* k2d, struct requ
                 rq_lat = k2d->rr_2048K_lat;
             }
             break;
-        case REQ_OP_WRITE:
+        case K2_REQ_WRITE:
             K2_LOG(printk(KERN_INFO "k2: Request is write"));
             if(rq_size <= K2_512) {
                 rq_lat = k2d->rw_512_lat;
@@ -780,6 +818,14 @@ static inline void k2_remove_latency(struct k2_data* k2d, struct request* rq)
 {
     unsigned int count;
     latency_ns_t lat;
+    latency_ns_t rq_lat;
+
+    rq_lat = k2_get_rq_latency(rq);
+    if (rq_lat < 0 ) {
+      printk(KERN_ERR "k2: Encountered negative request latency, aborting k2_remove_latency()\n");
+      dump_stack();
+      return;
+    }
 
     assert_spin_locked(&k2d->lock);
 
@@ -790,8 +836,8 @@ static inline void k2_remove_latency(struct k2_data* k2d, struct request* rq)
         count--;
     }
 
-    if (lat > k2_get_rq_latency(rq)) {
-        lat -= k2_get_rq_latency(rq);
+    if (lat > rq_lat) {
+        lat -= rq_lat;
     } else {
         lat = 0;
     }
@@ -863,7 +909,7 @@ static inline bool k2_does_request_fit(struct k2_data* k2d, struct request* rq) 
     bool does_fit;
 
     // Do not deadlock when request time exceeds maximum inflight latency
-    if (k2d->inflight < K2_MINIMUM_COHERENT_REQUEST_COUNT) {
+    if (k2d->inflight <= K2_MINIMUM_COHERENT_REQUEST_COUNT) {
         K2_LOG(printk(KERN_INFO "k2: Queue length is lower than throttling threshold, request dispatch accepted!"));
         return true;
     }
@@ -1199,10 +1245,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 				q->last_merge = rq;
 		}
 
-        // Set the estimated processing time for this process
         pid = current->pid;
-        rq_lat = k2_expected_request_latency(k2d, rq);
-        k2_set_rq_data(rq, rq_lat, pid);
 
         // If there exists a dynamic realtime queue for this task, add the request there
         if (!list_empty(&k2d->rt_dynamic_rqs)) {
@@ -1536,6 +1579,10 @@ static void k2_requests_merged(struct request_queue *q, struct request *rq,
     unsigned long flags;
 
     K2_LOG(printk(KERN_INFO "k2: Entering k2_requests_merged"));
+    if (!k2_rq_is_managed_by_k2(rq) || !k2_rq_is_managed_by_k2(next)) {
+      printk(KERN_ERR "k2: Merged 2 requests, where at least one was not managed by k2 before!\n");
+      dump_stack();
+    }
 
 
     spin_lock_irqsave(&k2d->lock, flags);
@@ -1559,35 +1606,37 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     latency_ns_t real_latency = k2_now() - rq->io_start_time_ns;
     struct list_head* list_elem;
     struct k2_dynamic_rt_rq* rt_rqs;
+    unsigned inflight;
 
     K2_LOG(printk(KERN_INFO "k2: Completed request %pK for process with PID %d and request size %u, sectors %d\n"
            ,rq, k2_get_rq_pid(rq), k2_get_rq_bytes(rq), blk_rq_stats_sectors(rq)));
 
-    trace_k2_completed_request(rq, real_latency);
-
     spin_lock_irqsave(&k2d->lock, flags);
 
-    k2_remove_latency(k2d, rq);
-
-    /*
-     * Read both counters here to avoid stall situation if max_inflight
-     * is modified simultaneously.
-     */
     current_lat = k2d->current_inflight_latency;
     max_lat = k2d->max_inflight_latency;
     lowest_upcoming_lat = k2d->lowest_upcoming_latency;
+    inflight = k2d->inflight;
 
-    // If the request was delivered by a dynamic realtime queue, update their processing time
-    if (!list_empty(&k2d->rt_dynamic_rqs)) {
+    // This request never touched the scheduler before.
+    // It is most likely a flush request, which uses the elv.priv fields for flush data.
+    // Both structs are contained in the same union.
+    if (k2_rq_is_managed_by_k2(rq)) {
+      k2_remove_latency(k2d, rq);
+      trace_k2_completed_request(rq, real_latency);
+
+      // If the request was delivered by a dynamic realtime queue, update their processing time
+      if (!list_empty(&k2d->rt_dynamic_rqs)) {
         list_for_each(list_elem, &k2d->rt_dynamic_rqs) {
-            rt_rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
-            if (rt_rqs->pid == k2_get_rq_pid(rq)) {
-                rt_rqs->last_request_latency = real_latency;
-                break;
-            }
+          rt_rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
+          if (rt_rqs->pid == k2_get_rq_pid(rq)) {
+            rt_rqs->last_request_latency = real_latency;
+            break;
+          }
         }
+      }
     }
-
+    
     spin_unlock_irqrestore(&k2d->lock, flags);
 
     /*
@@ -1595,10 +1644,25 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     * Rerunning the hw queues have to be done manually since we throttle
     * request dispatching. Mind that this has to be executed in async mode.
     */
-    // TODO: Use request fits method
-    if (current_lat < max_lat && ktime_sub(max_lat, current_lat) >= lowest_upcoming_lat) {
+    rerun_hw_queues:
+    K2_LOG(printk(KERN_INFO "Current lat: %llu, max lat: %llu, lowest upcoming: %llu", current_lat, max_lat, lowest_upcoming_lat));
+    // TODO: Use request fits method?
+    if (inflight <= K2_MINIMUM_COHERENT_REQUEST_COUNT || ktime_sub(max_lat, current_lat) >= lowest_upcoming_lat) {
+      K2_LOG(printk(KERN_INFO "k2: Rerun hardware queues\n"));
         blk_mq_run_hw_queues(rq->q, true);
+    } else {
+      K2_LOG(printk(KERN_INFO "k2: Do not rerun hardware queues\n"));
     }
+}
+
+void k2_prepare_request(struct request* rq)
+{
+  struct k2_data* k2d = rq->q->elevator->elevator_data;
+  pid_t pid = current->pid;
+
+  rq->elv.priv[0] = NULL;
+  rq->elv.priv[1] = NULL;
+  k2_set_rq_data(rq, k2_expected_request_latency(k2d, rq), pid);
 }
 
 static struct elevator_type k2_iosched = {
@@ -1618,6 +1682,7 @@ static struct elevator_type k2_iosched = {
         .next_request		= elv_rb_latter_request,
         .former_request		= elv_rb_former_request,
 		.requests_merged   = k2_requests_merged,
+        .prepare_request = k2_prepare_request,
 	},
 	.elevator_attrs = k2_attrs,
 	.elevator_name  = "k2",
