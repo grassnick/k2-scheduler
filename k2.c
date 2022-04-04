@@ -1065,7 +1065,7 @@ static int k2_del_all_dynamic_rt_rq(struct k2_data* k2d) {
             // TODO: How to handle requests still in software queues?
             //  Do nothing like in static queues? Are those lost?
             //  What about the associated kernel memory buffer?
-            printk("k2: Deleting realtime request queue for pid %d on %s", rqs->pid, k2d->rq->disk->disk_name);
+            printk(KERN_INFO "k2: Deleting realtime request queue for pid %d on %s", rqs->pid, k2d->rq->disk->disk_name);
             list_del(list_elem);
             kfree(rqs);
         }
