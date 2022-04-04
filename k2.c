@@ -67,6 +67,10 @@ static_assert(K2_MINIMUM_COHERENT_REQUEST_COUNT < U64_MAX);
 static_assert(K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT > 0);
 static_assert(K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT < U16_MAX);
 
+// The assumptions made, to store request data in the elv pointer fields in the request
+// assumes, pointer with is 64bit
+static_assert(sizeof(void*) == sizeof(u64), "Pointers are required to be 64 bit wide");
+
 
 
 /** The initial value for the maximum in-flight latency */
@@ -769,11 +773,11 @@ static inline u32 k2_get_rq_bytes(struct request* rq)
 
 static inline pid_t k2_get_rq_pid(struct request* rq)
 {
-    return (pid_t)rq->elv.priv[1];
+    return (pid_t)(uintptr_t)rq->elv.priv[1];
 }
 
 static inline u16 k2_get_rq_schedule_attempts_rt_constraint(struct request* rq) {
-    return (u16)((u64)rq->elv.priv[1] >> 48);
+    return (u16)((u64)(uintptr_t)rq->elv.priv[1] >> 48);
 }
 
 

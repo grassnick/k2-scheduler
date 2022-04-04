@@ -27,7 +27,7 @@ TRACE_EVENT(k2_completed_request,
             __entry->request_size = (u32)(blk_rq_stats_sectors(rq) << SECTOR_SHIFT);
             __entry->estimated_latency = (uintptr_t)rq->elv.priv[0];
             __entry->real_latency = real_latency;
-            __entry->pid = (s32)rq->elv.priv[1];
+            __entry->pid = (s32)(uintptr_t)rq->elv.priv[1];
         ),
 
         TP_printk("%u,%llu,%llu",
