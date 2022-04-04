@@ -700,13 +700,12 @@ static latency_ns_t k2_expected_request_latency(struct k2_data* k2d, struct requ
 
     // Requests that are neither write nor read are not taken into account
     latency_ns_t rq_lat = 0;
-
-    K2_LOG(printk(KERN_INFO "k2: Request size: %u (%uk)", rq_size, rq_size / 1024));
     unsigned type = k2_req_type(rq);
+
+    K2_LOG(printk(KERN_INFO "k2: Request size: %u (%uk), type: %s", rq_size, rq_size / 1024, k2_req_type_names[type]));
 
     switch (type) {
         case K2_REQ_READ:
-            K2_LOG(printk(KERN_INFO "k2: Request is read"));
             if(rq_size <= K2_512) {
                 rq_lat = k2d->rr_512_lat;
             } else if (rq_size <= K2_32K) {
@@ -718,7 +717,6 @@ static latency_ns_t k2_expected_request_latency(struct k2_data* k2d, struct requ
             }
             break;
         case K2_REQ_WRITE:
-            K2_LOG(printk(KERN_INFO "k2: Request is write"));
             if(rq_size <= K2_512) {
                 rq_lat = k2d->rw_512_lat;
             } else if (rq_size <= K2_32K) {
@@ -1220,7 +1218,6 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 		struct request *rq;
 		int    prio_class;
 		int    prio_value;
-        latency_ns_t rq_lat;
         pid_t pid;
         struct list_head* list_item;
         struct list_head* k2_queue;
@@ -1648,7 +1645,6 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     * Rerunning the hw queues have to be done manually since we throttle
     * request dispatching. Mind that this has to be executed in async mode.
     */
-    rerun_hw_queues:
     K2_LOG(printk(KERN_INFO "Current lat: %llu, max lat: %llu, lowest upcoming: %llu", current_lat, max_lat, lowest_upcoming_lat));
     // TODO: Use request fits method?
     if (inflight <= K2_MINIMUM_COHERENT_REQUEST_COUNT || ktime_sub(max_lat, current_lat) >= lowest_upcoming_lat) {
