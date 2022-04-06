@@ -73,20 +73,22 @@ static_assert(sizeof(void*) == sizeof(u64), "Pointers are required to be 64 bit 
 
 
 
+
+
+#define K2_RR_512_LAT  157161
+#define K2_RR_128K_LAT 622957
+#define K2_RR_508K_LAT 1078027
+
+#define K2_RW_512_LAT  79946
+#define K2_RW_128K_LAT 123646
+#define K2_RW_508K_LAT 254603
+
+#define K2_512  512
+#define K2_128K 131072
+#define K2_508K 520192 // Maximum request size for NVMe devices
+
 /** The initial value for the maximum in-flight latency */
-#define K2_MAX_INFLIGHT_USECONDS 62490 * 4
-
-#define K2_RR_512_LAT   61570
-#define K2_RR_32K_LAT   70905
-#define K2_RR_2048K_LAT 686210
-
-#define K2_RW_512_LAT   68285
-#define K2_RW_32K_LAT   76260
-#define K2_RW_2048K_LAT 707430
-
-#define K2_512 512
-#define K2_32K 32 << 10
-#define K2_2048K 2 << 20
+#define K2_MAX_INFLIGHT_USECONDS K2_RR_508K_LAT * 8
 
 #define k2_now() ktime_get_ns()
 
@@ -134,13 +136,15 @@ struct k2_data {
     /* Expected latencies for typical access sizes */
     /* Random Read */
     latency_ns_t rr_512_lat;
-    latency_ns_t rr_32K_lat;
-    latency_ns_t rr_2048K_lat;
+    latency_ns_t rr_128K_lat;
+    latency_ns_t rr_508K_lat;
+
+
 
     /* Random Write */
     latency_ns_t rw_512_lat;
-    latency_ns_t rw_32K_lat;
-    latency_ns_t rw_2048K_lat;
+    latency_ns_t rw_128K_lat;
+    latency_ns_t rw_508K_lat;
 
 	/* further group real-time requests by I/O priority */
 	struct list_head rt_reqs[IOPRIO_BE_NR];
@@ -690,41 +694,42 @@ static latency_ns_t k2_linear_interpolation(const u32 val
 
 }
 
+static u32 k2_get_rq_bytes(struct request* rq);
 /**
  * @brief Determine the expected latency of a request
  */
 static latency_ns_t k2_expected_request_latency(struct k2_data* k2d, struct request* rq)
 {
-    const unsigned int rq_size = blk_rq_bytes(rq);
+    const unsigned int rq_size = k2_get_rq_bytes(rq);
     //unsigned int rq_sectors = blk_rq_sectors(rq);
 
     // Requests that are neither write nor read are not taken into account
     latency_ns_t rq_lat = 0;
     unsigned type = k2_req_type(rq);
 
-    K2_LOG(printk(KERN_INFO "k2: Request size: %u (%uk), type: %s", rq_size, rq_size / 1024, k2_req_type_names[type]));
+    K2_LOG(printk(KERN_INFO "k2: Request size: %u (%uk), type: %s", rq_size, rq_size >> 10, k2_req_type_names[type]));
 
     switch (type) {
         case K2_REQ_READ:
             if(rq_size <= K2_512) {
                 rq_lat = k2d->rr_512_lat;
-            } else if (rq_size <= K2_32K) {
-                rq_lat = k2_linear_interpolation(rq_size, K2_512, K2_32K, k2d->rr_512_lat, k2d->rr_32K_lat);
-            } else if (rq_size < K2_2048K) {
-                rq_lat = k2_linear_interpolation(rq_size, K2_32K, K2_2048K, k2d->rr_32K_lat, k2d->rr_2048K_lat);
+            } else if (rq_size <= K2_128K) {
+                rq_lat = k2_linear_interpolation(rq_size, K2_512, K2_128K, k2d->rr_512_lat, k2d->rr_128K_lat);
+            } else if (rq_size < K2_508K) {
+                rq_lat = k2_linear_interpolation(rq_size, K2_128K, K2_508K, k2d->rr_128K_lat, k2d->rr_508K_lat);
             } else {
-                rq_lat = k2d->rr_2048K_lat;
+                rq_lat = k2d->rr_508K_lat;
             }
             break;
         case K2_REQ_WRITE:
             if(rq_size <= K2_512) {
                 rq_lat = k2d->rw_512_lat;
-            } else if (rq_size <= K2_32K) {
-                rq_lat = k2_linear_interpolation(rq_size, K2_512, K2_32K, k2d->rw_512_lat, k2d->rw_32K_lat);
-            } else if (rq_size < K2_2048K) {
-                rq_lat = k2_linear_interpolation(rq_size, K2_32K, K2_2048K, k2d->rw_32K_lat, k2d->rw_2048K_lat);
+            } else if (rq_size <= K2_128K) {
+                rq_lat = k2_linear_interpolation(rq_size, K2_512, K2_128K, k2d->rw_512_lat, k2d->rw_128K_lat);
+            } else if (rq_size < K2_508K) {
+                rq_lat = k2_linear_interpolation(rq_size, K2_128K, K2_508K, k2d->rw_128K_lat, k2d->rw_508K_lat);
             } else {
-                rq_lat = k2d->rw_2048K_lat;
+                rq_lat = k2d->rw_508K_lat;
             }
             break;
         default:
@@ -765,9 +770,8 @@ static inline latency_ns_t k2_get_rq_latency(struct request* rq)
 
 static inline u32 k2_get_rq_bytes(struct request* rq)
 {
-    return (u32)rq->stats_sectors << SECTOR_SHIFT;
+    return blk_rq_payload_bytes(rq);
 }
-
 
 static inline pid_t k2_get_rq_pid(struct request* rq)
 {
@@ -1146,12 +1150,12 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 	k2d->sort_list[WRITE] = RB_ROOT;
 
     k2d->rr_512_lat = K2_RR_512_LAT;
-    k2d->rr_32K_lat = K2_RR_32K_LAT;
-    k2d->rr_2048K_lat = K2_RR_2048K_LAT;
+    k2d->rr_128K_lat = K2_RR_128K_LAT;
+    k2d->rr_508K_lat = K2_RR_508K_LAT;
 
     k2d->rw_512_lat = K2_RW_512_LAT;
-    k2d->rw_32K_lat = K2_RW_32K_LAT;
-    k2d->rw_2048K_lat = K2_RW_2048K_LAT;
+    k2d->rw_128K_lat = K2_RW_128K_LAT;
+    k2d->rw_508K_lat = K2_RW_508K_LAT;
 
     INIT_LIST_HEAD(&k2d->global_k2_list_element);
 
@@ -1204,6 +1208,8 @@ static bool k2_has_work(struct blk_mq_hw_ctx *hctx)
 	return(has_work);
 }
 
+void k2_prepare_request(struct request* rq);
+
 /* Inserts a request into the scheduler queue. For now, at_head is ignored! */
 static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
 				bool at_head)
@@ -1225,6 +1231,10 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 
         rq = list_first_entry(rqs, struct request, queuelist);
 		list_del_init(&rq->queuelist);
+
+                k2_prepare_request(rq);
+
+                //printk(KERN_WARNING "k2: Insert  REQ: size: %u (%u K), offset %llu, segments: %u  || BIO: how many bio bio_vecs %u \n", blk_rq_bytes(rq), blk_rq_bytes(rq) >> 10, blk_rq_pos(rq), blk_rq_nr_phys_segments(rq) , rq->bio->bi_vcnt);
 
 		/* if task has no io prio, derive it from its nice value */
 		if (ioprio_valid(rq->ioprio)) {
@@ -1617,13 +1627,12 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     lowest_upcoming_lat = k2d->lowest_upcoming_latency;
     inflight = k2d->inflight;
 
-    // This request never touched the scheduler before.
-    // It is most likely a flush request, which uses the elv.priv fields for flush data.
+    // This request has been touched by the scheduler before.
+    // If this is not the case, it is most likely a flush request, which uses the elv.priv fields for flush data.
     // Both structs are contained in the same union.
     if (k2_rq_is_managed_by_k2(rq)) {
-
-      K2_LOG(printk(KERN_INFO "k2: Completed request %pK for process with PID %d and request size %u, sectors %d\n"
-             ,rq, k2_get_rq_pid(rq), k2_get_rq_bytes(rq), blk_rq_stats_sectors(rq)));
+      K2_LOG(printk(KERN_INFO "k2: Completed request %px for process with PID %d and request size %u, sectors %d, Real latency: %lld, estimated latency: %lld\n"
+             ,rq, k2_get_rq_pid(rq), (blk_rq_stats_sectors(rq) << SECTOR_SHIFT) >> 10 , blk_rq_stats_sectors(rq), real_latency, k2_get_rq_latency(rq)));
       k2_remove_latency(k2d, rq);
       trace_k2_completed_request(rq, real_latency);
 
@@ -1663,6 +1672,14 @@ void k2_prepare_request(struct request* rq)
 
   rq->elv.priv[0] = NULL;
   rq->elv.priv[1] = NULL;
+
+  // For some unknown reason, this flag is set in the block layer only
+  // if the prepare_request() callback is invoked, and even then, after the callback's invocation
+  // This flag is required in k2_complete_request() To only process valid requests, that previously passed k2
+  // However, When using this function as a callback for elv.ops.prepare_request(), the request size is not yet available,
+  // thus, it is invoked manually in k2_insert_request() and the RQF_ELVPRIV is set manually.
+  rq->rq_flags |= RQF_ELVPRIV;
+
   k2_set_rq_data(rq, k2_expected_request_latency(k2d, rq), pid);
 }
 
@@ -1683,7 +1700,6 @@ static struct elevator_type k2_iosched = {
         .next_request		= elv_rb_latter_request,
         .former_request		= elv_rb_former_request,
 		.requests_merged   = k2_requests_merged,
-        .prepare_request = k2_prepare_request,
 	},
 	.elevator_attrs = k2_attrs,
 	.elevator_name  = "k2",
