@@ -47,6 +47,9 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(k2_completed_request);
 // Device and ioctl related
 #include "k2.h"
 
+// Ringbuffer implementation
+#include "ringbuf.h"
+
 /** Macro to disable Kernel massages meant for debugging */
 #define K2_LOG(log)
 
@@ -91,6 +94,20 @@ static_assert(sizeof(void*) == sizeof(u64), "Pointers are required to be 64 bit 
 #define K2_MAX_INFLIGHT_USECONDS K2_RR_508K_LAT * 8
 
 #define k2_now() ktime_get_ns()
+
+
+// Dynamic load level adjustment related
+#define K2_ENABLE_LOAD_ADJUST 0
+typedef u64 load_adjust_t;
+
+#define K2_LOAD_ADJUST_WINDOW_LEN 100ULL
+#define K2_LOAD_ADJUST_MULT 1000ULL
+#define K2_LOAD_ADJUST_MULT_MIN 1ULL
+#define K2_LOAD_ADJUST_MULT_MAX (K2_LOAD_ADJUST_MULT * 1000ULL)
+#define K2_LOAD_ADJUST_DEFAULT (K2_LOAD_ADJUST_WINDOW_LEN * K2_LOAD_ADJUST_MULT)
+#define K2_LOAD_ADJUST_MAX (K2_LOAD_ADJUST_DEFAULT * K2_LOAD_ADJUST_MULT)
+#define K2_LOAD_ADJUST_MIN 1ULL
+static_assert(K2_LOAD_ADJUST_MAX < U64_MAX);
 
 extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
 		struct request **merged_request);
@@ -145,6 +162,12 @@ struct k2_data {
     latency_ns_t rw_512_lat;
     latency_ns_t rw_128K_lat;
     latency_ns_t rw_508K_lat;
+
+    load_adjust_t write_load_mult;
+    load_adjust_t read_load_mult;
+
+    struct ringbuf last_read_ratios;
+    struct ringbuf last_write_ratios;
 
 	/* further group real-time requests by I/O priority */
 	struct list_head rt_reqs[IOPRIO_BE_NR];
@@ -694,6 +717,21 @@ static latency_ns_t k2_linear_interpolation(const u32 val
 
 }
 
+static void k2_load_adjust_sliding_window(load_adjust_t* mult, struct ringbuf* rb, load_adjust_t estimated_latency, load_adjust_t real_latency)
+{
+  load_adjust_t last_ratio;
+  load_adjust_t old_mult = *mult;
+  load_adjust_t new_ratio =  real_latency * K2_LOAD_ADJUST_MULT / estimated_latency;
+  new_ratio = clamp_val(new_ratio, K2_LOAD_ADJUST_MULT_MIN, K2_LOAD_ADJUST_MULT_MAX);
+
+  *mult += new_ratio;
+
+  // Undo operation that is no longer valid
+  ringbuf_pushback(rb, new_ratio, last_ratio, load_adjust_t);
+  *mult -= last_ratio;
+  //printk("k2: OLD: %llu, NEW: %llu: %llu estimated: %lld, real: %lld last_ratio: %llu, new_ratio %llu, %llu\n", old_mult, *mult, *(mult)/K2_LOAD_ADJUST_DEFAULT, estimated_latency, real_latency, last_ratio, new_ratio, new_ratio / K2_LOAD_ADJUST_MULT);
+}
+
 static u32 k2_get_rq_bytes(struct request* rq);
 /**
  * @brief Determine the expected latency of a request
@@ -756,6 +794,11 @@ static inline void k2_set_rq_data(struct request* rq, latency_ns_t rq_lat, pid_t
     // The pid, and later on, the number of attempts to schedule the request
     // 16 RTC Attempts | 16 Reserved | 32 PID
     rq->elv.priv[1] = (void*)((u64) NULL | (s32) pid);
+}
+
+static inline void k2_set_rq_latency(struct request* rq, latency_ns_t lat)
+{
+  rq->elv.priv[0] = (void*)(latency_ns_t)lat;
 }
 
 /**
@@ -1124,6 +1167,8 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 	struct k2_data        *k2d;
 	struct elevator_queue *eq;
 	unsigned i;
+        struct ringbuf* rb;
+        void* ringbuf_iter;
 
 	eq = elevator_alloc(rq, et);
 	if (eq == NULL)
@@ -1157,6 +1202,16 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
     k2d->rw_128K_lat = K2_RW_128K_LAT;
     k2d->rw_508K_lat = K2_RW_508K_LAT;
 
+    k2d->read_load_mult = K2_LOAD_ADJUST_DEFAULT;
+    k2d->write_load_mult = K2_LOAD_ADJUST_DEFAULT;
+
+    rb = &k2d->last_read_ratios;
+    ringbuf_init(rb, K2_LOAD_ADJUST_WINDOW_LEN, load_adjust_t);
+    ringbuf_set_all(rb, K2_LOAD_ADJUST_MULT, load_adjust_t, ringbuf_iter);
+    rb = &k2d->last_write_ratios;
+    ringbuf_init(rb, K2_LOAD_ADJUST_WINDOW_LEN, load_adjust_t);
+    ringbuf_set_all(rb, K2_LOAD_ADJUST_MULT, load_adjust_t, ringbuf_iter);
+
     INIT_LIST_HEAD(&k2d->global_k2_list_element);
 
 	spin_lock_init(&k2d->lock);
@@ -1182,6 +1237,7 @@ static void k2_exit_sched(struct elevator_queue *eq)
 {
 	struct k2_data *k2d = eq->elevator_data;
     char* blk_name = k2d->rq->disk->disk_name;
+    struct ringbuf* rb;
 
     // Delete from global dev node
     if (k2_global_k2_dev) {
@@ -1189,6 +1245,11 @@ static void k2_exit_sched(struct elevator_queue *eq)
     }
 
     k2_del_all_dynamic_rt_rq(k2d);
+
+    rb = &k2d->last_read_ratios;
+    ringbuf_free(rb);
+    rb = &k2d->last_write_ratios;
+    ringbuf_free(rb);
 
 	kfree(k2d);
     k2d = NULL;
@@ -1234,7 +1295,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 
                 k2_prepare_request(rq);
 
-                //printk(KERN_WARNING "k2: Insert  REQ: size: %u (%u K), offset %llu, segments: %u  || BIO: how many bio bio_vecs %u \n", blk_rq_bytes(rq), blk_rq_bytes(rq) >> 10, blk_rq_pos(rq), blk_rq_nr_phys_segments(rq) , rq->bio->bi_vcnt);
+                //printk(KERN_WARNING "k2: Insert %s REQ: size: %u (%u K), offset %llu, segments: %u  || BIO: how many bio bio_vecs %u \n", k2_req_type_names[k2_req_type(rq)], blk_rq_bytes(rq), blk_rq_bytes(rq) >> 10, blk_rq_pos(rq), blk_rq_nr_phys_segments(rq) , rq->bio->bi_vcnt);
 
 		/* if task has no io prio, derive it from its nice value */
 		if (ioprio_valid(rq->ioprio)) {
@@ -1318,6 +1379,8 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	unsigned long flags;
 	unsigned int  i;
     struct k2_dynamic_rt_rq* next_rt_rqs = NULL;
+    int request_type;
+    latency_ns_t latency_tmp;
     K2_LOG(int pid);
 
     K2_LOG(printk(KERN_INFO "k2: Entering dispatch \n"));
@@ -1408,6 +1471,21 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
     goto abort;
 
 end:
+#if K2_ENABLE_LOAD_ADJUST == 1
+    request_type = k2_req_type(rq);
+    switch (request_type) {
+      case K2_REQ_WRITE:
+        latency_tmp = k2_get_rq_latency(rq);
+        k2_set_rq_latency(rq, (load_adjust_t)latency_tmp * k2d->write_load_mult / K2_LOAD_ADJUST_DEFAULT);
+        break;
+      case K2_REQ_READ:
+        latency_tmp = k2_get_rq_latency(rq);
+        k2_set_rq_latency(rq, (load_adjust_t)latency_tmp * k2d->read_load_mult / K2_LOAD_ADJUST_DEFAULT);
+        break;
+      default:
+        break;
+    }
+#endif
     K2_LOG(printk(KERN_INFO "k2: Try Dispatch request %pK\n",rq));
     if (!k2_does_request_fit2(k2d, rq, next_rt_rqs)) {
         K2_LOG(u16 val = k2_get_rq_schedule_attempts_rt_constraint(rq);
@@ -1415,6 +1493,9 @@ end:
             max_retries = val;
             printk(KERN_INFO "k2: Dispatch request %pK ABORTED, %u, %u, %u, %px\n", rq, val, max_retries, k2_get_rq_pid(rq), rq->elv.priv[1]);
         })
+#if K2_ENABLE_LOAD_ADJUST == 1
+        k2_set_rq_latency(rq, latency_tmp);
+#endif
         goto abort;
     }
 dynamic_end:
@@ -1614,10 +1695,12 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     latency_ns_t current_lat;
     latency_ns_t max_lat;
     latency_ns_t lowest_upcoming_lat;
-    latency_ns_t real_latency = k2_now() - rq->io_start_time_ns;
+    latency_ns_t now = k2_now();
+    latency_ns_t real_latency = (now >= rq->io_start_time_ns) ? now - (latency_ns_t)rq->io_start_time_ns : 0;
     struct list_head* list_elem;
     struct k2_dynamic_rt_rq* rt_rqs;
     unsigned inflight;
+    struct ringbuf* rb;
 
 
     spin_lock_irqsave(&k2d->lock, flags);
@@ -1631,8 +1714,8 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     // If this is not the case, it is most likely a flush request, which uses the elv.priv fields for flush data.
     // Both structs are contained in the same union.
     if (k2_rq_is_managed_by_k2(rq)) {
-      K2_LOG(printk(KERN_INFO "k2: Completed request %px for process with PID %d and request size %u, sectors %d, Real latency: %lld, estimated latency: %lld\n"
-             ,rq, k2_get_rq_pid(rq), (blk_rq_stats_sectors(rq) << SECTOR_SHIFT) >> 10 , blk_rq_stats_sectors(rq), real_latency, k2_get_rq_latency(rq)));
+      //printk(KERN_INFO "k2: Completed %s request %px for process with PID %d and request size %u, sectors %d, Real latency: %lld, estimated latency: %lld\n",
+      //      k2_req_type_names[k2_req_type(rq)] ,rq, k2_get_rq_pid(rq), (blk_rq_stats_sectors(rq) << SECTOR_SHIFT) >> 10 , blk_rq_stats_sectors(rq), real_latency, k2_get_rq_latency(rq));
       k2_remove_latency(k2d, rq);
       trace_k2_completed_request(rq, real_latency);
 
@@ -1646,8 +1729,25 @@ static void k2_completed_request(struct request *rq, u64 watDis)
           }
         }
       }
+
+#if K2_ENABLE_LOAD_ADJUST == 1
+      // Adjust dynamic load multiplier
+      switch (k2_req_type(rq)) {
+        case K2_REQ_READ:
+          rb = &k2d->last_read_ratios;
+          k2_load_adjust_sliding_window(&k2d->read_load_mult, rb, k2_get_rq_latency(rq), real_latency);
+          break;
+        case K2_REQ_WRITE:
+          rb = &k2d->last_write_ratios;
+          k2_load_adjust_sliding_window(&k2d->write_load_mult, rb, k2_get_rq_latency(rq), real_latency);
+          break;
+        default:
+          break;
+      }
+#endif
     }
-    
+
+
     spin_unlock_irqrestore(&k2d->lock, flags);
 
     /*
