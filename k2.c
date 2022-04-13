@@ -1371,7 +1371,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	unsigned long flags;
 	unsigned int  i;
     struct k2_dynamic_rt_rq* next_rt_rqs = NULL;
-    int request_type;
+    unsigned int request_type;
     latency_ns_t latency_tmp;
     K2_LOG(int pid);
 
