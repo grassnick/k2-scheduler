@@ -653,9 +653,6 @@ static bool _k2_has_work(struct k2_data *k2d)
     struct list_head* list_elem;
     struct k2_dynamic_rt_rq* rt_rqs;
 
-    assert_spin_locked(&k2d->lock);
-
-
     // If either the limit of concurrent request latencies is reached and there are no more "free" requests left, abort
     if (k2d->max_inflight_latency - k2d->current_inflight_latency < k2d->lowest_upcoming_latency
         && k2d->inflight > K2_MINIMUM_COHERENT_REQUEST_COUNT) {
@@ -848,7 +845,6 @@ static inline void k2_add_latency(struct k2_data* k2d, struct request* rq)
     const unsigned int count = k2d->inflight + 1;
     const latency_ns_t lat = ktime_add(k2d->current_inflight_latency, k2_get_rq_latency(rq));
 
-    assert_spin_locked(&k2d->lock);
 
     K2_LOG(printk(KERN_DEBUG "k2: Added: current inflight %u, current_latency %lld", count, lat));
 
@@ -875,8 +871,6 @@ static inline void k2_remove_latency(struct k2_data* k2d, struct request* rq)
       dump_stack();
       return;
     }
-
-    assert_spin_locked(&k2d->lock);
 
     count = k2d->inflight;
     lat = k2d->current_inflight_latency;
@@ -911,8 +905,6 @@ static void k2_update_lowest_pending_latency(struct k2_data* k2d)
     struct k2_dynamic_rt_rq* rt_rqs;
     latency_ns_t lowest_lat = LATENCY_NS_T_MAX;
     latency_ns_t rq_lat;
-
-    assert_spin_locked(&k2d->lock);
 
     // Realtime prio requests
     for (i = 0; i < IOPRIO_BE_NR; i++) {
@@ -1615,8 +1607,6 @@ static int k2_request_merge(struct request_queue *q, struct request **rq,
 	sector_t sector = bio_end_sector(bio);
 
     K2_LOG(printk(KERN_INFO "k2: Entering k2_request_merge\n"));
-
-	assert_spin_locked(&k2d->lock);
 
 	// should request merging cross I/O prios?
 
