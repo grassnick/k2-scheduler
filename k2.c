@@ -109,6 +109,12 @@ typedef u64 load_adjust_t;
 #define K2_LOAD_ADJUST_MIN 1ULL
 static_assert(K2_LOAD_ADJUST_MAX < U64_MAX);
 
+
+#define K2_ENABLE_ACCESS_PATTERN 1
+// Assume a random io threshold of 16M based on the results from iocost
+#define K2_RANDIO_THRESHOLD 16 << 20
+
+
 extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
 		struct request **merged_request);
 
@@ -738,6 +744,18 @@ static latency_ns_t k2_expected_request_latency(struct k2_data* k2d, struct requ
     // Requests that are neither write nor read are not taken into account
     latency_ns_t rq_lat = 0;
     unsigned type = k2_req_type(rq);
+
+#if K2_ENABLE_ACCESS_PATTERN == 1
+    bool random_access = false;
+    sector_t rq_sector_pos = blk_rq_pos(rq);
+    u64 bytes_diff = abs(rq_sector_pos - k2d->last_dispatched_sector) << SECTOR_SHIFT;
+
+    if (bytes_diff > K2_RANDIO_THRESHOLD) {
+      random_access = true;
+    }
+    K2_LOG(printk(KERN_ERR "k2: Access is random: %d\n", random_access));
+
+#endif
 
     K2_LOG(printk(KERN_INFO "k2: Request size: %u (%uk), type: %s", rq_size, rq_size >> 10, k2_req_type_names[type]));
 
@@ -1671,6 +1689,9 @@ static void k2_completed_request(struct request *rq, u64 watDis)
         default:
           break;
       }
+#endif
+#if K2_ENABLE_ACCESS_PATTERN == 1
+      k2d->last_dispatched_sector = blk_rq_pos(rq);
 #endif
     }
 
