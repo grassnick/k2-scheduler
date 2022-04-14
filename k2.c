@@ -142,13 +142,8 @@ struct k2_data {
      */
     latency_ns_t max_inflight_latency;
 
-    /**
-     * @brief The lowest upcoming estimated request processing time in any software scheduler request queue
-     * @details Speeds up k2_has_work() checks
-     */
-    latency_ns_t lowest_upcoming_latency;
-
-
+    /* The last accessed start sector - use to detect random io */
+    sector_t last_dispatched_sector;
 
     /* Expected latencies for typical access sizes */
     /* Random Read */
@@ -653,8 +648,8 @@ static bool _k2_has_work(struct k2_data *k2d)
     struct list_head* list_elem;
     struct k2_dynamic_rt_rq* rt_rqs;
 
-    // If either the limit of concurrent request latencies is reached and there are no more "free" requests left, abort
-    if (k2d->max_inflight_latency - k2d->current_inflight_latency < k2d->lowest_upcoming_latency
+    // If the limit of concurrent request latencies is reached and there are no more "free" requests left, abort
+    if (k2d->current_inflight_latency >= k2d->max_inflight_latency
         && k2d->inflight > K2_MINIMUM_COHERENT_REQUEST_COUNT) {
         return(false);
     }
@@ -717,7 +712,7 @@ static latency_ns_t k2_linear_interpolation(const u32 val
 static void k2_load_adjust_sliding_window(load_adjust_t* mult, struct ringbuf* rb, load_adjust_t estimated_latency, load_adjust_t real_latency)
 {
   load_adjust_t last_ratio;
-  load_adjust_t old_mult = *mult;
+  K2_LOG(load_adjust_t old_mult = *mult;)
   load_adjust_t new_ratio =  real_latency * K2_LOAD_ADJUST_MULT / estimated_latency;
   new_ratio = clamp_val(new_ratio, K2_LOAD_ADJUST_MULT_MIN, K2_LOAD_ADJUST_MULT_MAX);
 
@@ -726,12 +721,14 @@ static void k2_load_adjust_sliding_window(load_adjust_t* mult, struct ringbuf* r
   // Undo operation that is no longer valid
   ringbuf_pushback(rb, new_ratio, last_ratio, load_adjust_t);
   *mult -= last_ratio;
-  //printk("k2: OLD: %llu, NEW: %llu: %llu estimated: %lld, real: %lld last_ratio: %llu, new_ratio %llu, %llu\n", old_mult, *mult, *(mult)/K2_LOAD_ADJUST_DEFAULT, estimated_latency, real_latency, last_ratio, new_ratio, new_ratio / K2_LOAD_ADJUST_MULT);
+  K2_LOG(printk("k2: OLD: %llu, NEW: %llu: %llu estimated: %lld, real: %lld last_ratio: %llu, new_ratio %llu, %llu\n", old_mult, *mult, *(mult)/K2_LOAD_ADJUST_DEFAULT, estimated_latency, real_latency, last_ratio, new_ratio, new_ratio / K2_LOAD_ADJUST_MULT);)
 }
 
 static u32 k2_get_rq_bytes(struct request* rq);
 /**
  * @brief Determine the expected latency of a request
+ * @details This estimation is stateful and depends on the current load and access situation of the device,
+ * call only from k2_dispatch_request()
  */
 static latency_ns_t k2_expected_request_latency(struct k2_data* k2d, struct request* rq)
 {
@@ -755,6 +752,9 @@ static latency_ns_t k2_expected_request_latency(struct k2_data* k2d, struct requ
             } else {
                 rq_lat = k2d->rr_508K_lat;
             }
+#if K2_ENABLE_LOAD_ADJUST == 1
+            rq_lat = (load_adjust_t)rq_lat * k2d->read_load_mult / K2_LOAD_ADJUST_DEFAULT;
+#endif
             break;
         case K2_REQ_WRITE:
             if(rq_size <= K2_512) {
@@ -766,6 +766,9 @@ static latency_ns_t k2_expected_request_latency(struct k2_data* k2d, struct requ
             } else {
                 rq_lat = k2d->rw_508K_lat;
             }
+#if K2_ENABLE_LOAD_ADJUST == 1
+            rq_lat = (load_adjust_t)rq_lat * k2d->write_load_mult / K2_LOAD_ADJUST_DEFAULT;
+#endif
             break;
         default:
             K2_LOG(printk(KERN_INFO "k2: Request is misc: %u", rq->cmd_flags & REQ_OP_MASK));
@@ -791,6 +794,11 @@ static inline void k2_set_rq_data(struct request* rq, latency_ns_t rq_lat, pid_t
     // The pid, and later on, the number of attempts to schedule the request
     // 16 RTC Attempts | 16 Reserved | 32 PID
     rq->elv.priv[1] = (void*)((u64) NULL | (s32) pid);
+}
+
+static inline void k2_set_rq_pid(struct request* rq, pid_t pid)
+{
+  rq->elv.priv[1] = (void*)((u64) NULL | (s32) pid);
 }
 
 static inline void k2_set_rq_latency(struct request* rq, latency_ns_t lat)
@@ -889,58 +897,6 @@ static inline void k2_remove_latency(struct k2_data* k2d, struct request* rq)
 
     k2d->inflight = count;
     k2d->current_inflight_latency = lat;
-}
-
-/**
- * @brief Update the lowest pending request time in the software queues
- * @details This function has to be called from a locked context, as concurrent
- * accesses to the global struct would tamper with the result
- * @param k2d The global k2_data structure
- */
-static void k2_update_lowest_pending_latency(struct k2_data* k2d)
-{
-    unsigned int i;
-    struct request* rq;
-    struct list_head* list_item;
-    struct k2_dynamic_rt_rq* rt_rqs;
-    latency_ns_t lowest_lat = LATENCY_NS_T_MAX;
-    latency_ns_t rq_lat;
-
-    // Realtime prio requests
-    for (i = 0; i < IOPRIO_BE_NR; i++) {
-        if (!list_empty(&k2d->rt_reqs[i])) {
-            rq = list_first_entry(&k2d->rt_reqs[i], struct request, queuelist);
-            rq_lat = k2_get_rq_latency(rq);
-            if (rq_lat < lowest_lat) {
-                lowest_lat = rq_lat;
-            }
-        }
-    }
-
-    // Non realtime requests
-    if (!list_empty(&k2d->be_reqs)) {
-        rq = list_first_entry(&k2d->be_reqs, struct request, queuelist);
-        rq_lat = k2_get_rq_latency(rq);
-        if (rq_lat < lowest_lat) {
-            lowest_lat = rq_lat;
-        }
-    }
-
-    // Dynamic realtime queues
-    if (!list_empty(&k2d->rt_dynamic_rqs)) {
-        list_for_each(list_item, &k2d->rt_dynamic_rqs) {
-            rt_rqs = list_entry(list_item, struct k2_dynamic_rt_rq, reqs);
-            if (!list_empty(&rt_rqs->reqs)) {
-                rq = list_first_entry(&rt_rqs->reqs, struct request, queuelist);
-                rq_lat = k2_get_rq_latency(rq);
-                if (rq_lat < lowest_lat) {
-                    lowest_lat = rq_lat;
-                }
-            }
-        }
-    }
-
-    k2d->lowest_upcoming_latency =  lowest_lat;
 }
 
 /**
@@ -1177,7 +1133,6 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 	k2d->inflight     =  0;
     k2d->current_inflight_latency = 0;
     k2d->max_inflight_latency = K2_MAX_INFLIGHT_USECONDS;
-    k2d->lowest_upcoming_latency = LATENCY_NS_T_MAX;
 	for (i = 0; i < IOPRIO_BE_NR; i++)
 		INIT_LIST_HEAD(&k2d->rt_reqs[i]);
 
@@ -1185,6 +1140,9 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 
 	k2d->sort_list[READ] = RB_ROOT;
 	k2d->sort_list[WRITE] = RB_ROOT;
+
+    // The first access will always be a random access
+    k2d->last_dispatched_sector = U64_MAX;
 
     k2d->rr_512_lat = K2_RR_512_LAT;
     k2d->rr_128K_lat = K2_RR_128K_LAT;
@@ -1353,8 +1311,6 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
         trace_block_rq_insert(rq);
         list_add_tail(&rq->queuelist, k2_queue);
 	}
-    // TODO: Inline this functionality to the iterations already done in this function
-    k2_update_lowest_pending_latency(k2d);
     spin_unlock_irqrestore(&k2d->lock, flags);
 }
 
@@ -1371,8 +1327,6 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	unsigned long flags;
 	unsigned int  i;
     struct k2_dynamic_rt_rq* next_rt_rqs = NULL;
-    unsigned int request_type;
-    latency_ns_t latency_tmp;
     K2_LOG(int pid);
 
     K2_LOG(printk(KERN_INFO "k2: Entering dispatch \n"));
@@ -1463,49 +1417,37 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
     goto abort;
 
 end:
-#if K2_ENABLE_LOAD_ADJUST == 1
-    request_type = k2_req_type(rq);
-    switch (request_type) {
-      case K2_REQ_WRITE:
-        latency_tmp = k2_get_rq_latency(rq);
-        k2_set_rq_latency(rq, (load_adjust_t)latency_tmp * k2d->write_load_mult / K2_LOAD_ADJUST_DEFAULT);
-        break;
-      case K2_REQ_READ:
-        latency_tmp = k2_get_rq_latency(rq);
-        k2_set_rq_latency(rq, (load_adjust_t)latency_tmp * k2d->read_load_mult / K2_LOAD_ADJUST_DEFAULT);
-        break;
-      default:
-        break;
-    }
-#endif
+  // A request from a non registered realtime task has to be checked to interfere with performance goals
+  // If it does not fit, no request is dispatched
     K2_LOG(printk(KERN_INFO "k2: Try Dispatch request %pK\n",rq));
+    k2_set_rq_latency(rq, k2_expected_request_latency(k2d, rq));
     if (!k2_does_request_fit2(k2d, rq, next_rt_rqs)) {
         K2_LOG(u16 val = k2_get_rq_schedule_attempts_rt_constraint(rq);
         if (val > max_retries) {
             max_retries = val;
             printk(KERN_INFO "k2: Dispatch request %pK ABORTED, %u, %u, %u, %px\n", rq, val, max_retries, k2_get_rq_pid(rq), rq->elv.priv[1]);
         })
-#if K2_ENABLE_LOAD_ADJUST == 1
-        k2_set_rq_latency(rq, latency_tmp);
-#endif
         goto abort;
     }
+    goto dispatch;
+
 dynamic_end:
+    // Realtime tasks get scheduled either way
+    k2_set_rq_latency(rq, k2_expected_request_latency(k2d, rq));
+
+dispatch:
     K2_LOG(printk(KERN_INFO "k2: Dispatch request %pK\n",rq));
 	k2_remove_request(q, rq);
     k2_add_latency(k2d, rq);
     rq->rq_flags |= RQF_STARTED;
-
-    // TODO: Inline this functionality to the iterations already done in this function
-    k2_update_lowest_pending_latency(k2d);
 
 	spin_unlock_irqrestore(&k2d->lock, flags);
 
 	return(rq);
 
 abort:
-    /* both request lists are empty or inflight counter is too high */
-    K2_LOG(printk(KERN_INFO "k2: Dispatch request %pK ABORTED\n", rq));
+  // Latency constraints could not be met
+  K2_LOG(printk(KERN_INFO "k2: Dispatch request %pK ABORTED\n", rq));
     spin_unlock_irqrestore(&k2d->lock, flags);
 
     return(NULL);
@@ -1668,12 +1610,9 @@ static void k2_requests_merged(struct request_queue *q, struct request *rq,
 
 
     spin_lock_irqsave(&k2d->lock, flags);
-    // TODO: How to handle inflight latency here? Is it necessary?
 
 	k2_remove_request(q, next);
-    k2_set_rq_data(rq, k2_expected_request_latency(k2d, rq), k2_get_rq_pid(rq));
     k2_set_rq_attempts_rt_constrain(rq, max(k2_get_rq_schedule_attempts_rt_constraint(rq), k2_get_rq_schedule_attempts_rt_constraint(next)));
-    k2_update_lowest_pending_latency(k2d);
 
     spin_unlock_irqrestore(&k2d->lock, flags);
 }
@@ -1684,20 +1623,18 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     unsigned long flags;
     latency_ns_t current_lat;
     latency_ns_t max_lat;
-    latency_ns_t lowest_upcoming_lat;
     latency_ns_t now = k2_now();
     latency_ns_t real_latency = (now >= rq->io_start_time_ns) ? now - (latency_ns_t)rq->io_start_time_ns : 0;
     struct list_head* list_elem;
     struct k2_dynamic_rt_rq* rt_rqs;
     unsigned inflight;
     struct ringbuf* rb;
-
+    bool has_work;
 
     spin_lock_irqsave(&k2d->lock, flags);
 
     current_lat = k2d->current_inflight_latency;
     max_lat = k2d->max_inflight_latency;
-    lowest_upcoming_lat = k2d->lowest_upcoming_latency;
     inflight = k2d->inflight;
 
     // This request has been touched by the scheduler before.
@@ -1737,6 +1674,7 @@ static void k2_completed_request(struct request *rq, u64 watDis)
 #endif
     }
 
+    has_work = _k2_has_work(k2d);
 
     spin_unlock_irqrestore(&k2d->lock, flags);
 
@@ -1745,9 +1683,8 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     * Rerunning the hw queues have to be done manually since we throttle
     * request dispatching. Mind that this has to be executed in async mode.
     */
-    K2_LOG(printk(KERN_INFO "Current lat: %llu, max lat: %llu, lowest upcoming: %llu", current_lat, max_lat, lowest_upcoming_lat));
-    // TODO: Use request fits method?
-    if (inflight <= K2_MINIMUM_COHERENT_REQUEST_COUNT || ktime_sub(max_lat, current_lat) >= lowest_upcoming_lat) {
+    K2_LOG(printk(KERN_INFO "Current lat: %llu, max lat: %llu\n", current_lat, max_lat));
+    if (has_work) {
       K2_LOG(printk(KERN_INFO "k2: Rerun hardware queues\n"));
         blk_mq_run_hw_queues(rq->q, true);
     } else {
@@ -1757,7 +1694,6 @@ static void k2_completed_request(struct request *rq, u64 watDis)
 
 void k2_prepare_request(struct request* rq)
 {
-  struct k2_data* k2d = rq->q->elevator->elevator_data;
   pid_t pid = current->pid;
 
   rq->elv.priv[0] = NULL;
@@ -1770,7 +1706,7 @@ void k2_prepare_request(struct request* rq)
   // thus, it is invoked manually in k2_insert_request() and the RQF_ELVPRIV is set manually.
   rq->rq_flags |= RQF_ELVPRIV;
 
-  k2_set_rq_data(rq, k2_expected_request_latency(k2d, rq), pid);
+  k2_set_rq_pid(rq, pid);
 }
 
 static struct elevator_type k2_iosched = {
