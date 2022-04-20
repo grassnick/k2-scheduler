@@ -121,6 +121,10 @@ static_assert(K2_LOAD_ADJUST_MAX < U64_MAX);
 #define K2_RANDIO_THRESHOLD 16 << 20
 
 
+// Starvation prevention
+#define K2_MAX_QUEUE_WAIT 5000000000 // 5 seconds
+
+
 extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
 		struct request **merged_request);
 
@@ -192,6 +196,9 @@ struct k2_data {
 	struct list_head rt_reqs[IOPRIO_BE_NR];
 	struct list_head be_reqs;
 
+        ktime_t last_rt_queue_dispatches[IOPRIO_BE_NR];
+        ktime_t last_be_queue_dispatch;
+
 	/* Sector-ordered lists for request merging
 	 * Request merging currently spans across different priorities,
 	 * this might interfere with latency constraints
@@ -255,6 +262,8 @@ struct k2_dynamic_rt_rq {
       * @details The scheduler expects periodic realtime tasks to issue requests of the same processing time.
       */
      latency_ns_t last_request_latency;
+
+     ktime_t last_dispatch;
 
     /**
      * @brief The list of requests that are part of this request queue
@@ -1026,6 +1035,7 @@ static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_ns_t int
     // After registration, there is no knowledge of the introduced latency by the request, this is set after the first request has completed
     rq->last_request_latency = 0;
 
+    rq->last_dispatch = 0;
     // Assume the default best effort scheduling class
     // This will be set correctly when the first request is inserted in the scheduler
     rq->prio_class = IOPRIO_CLASS_BE;
@@ -1155,10 +1165,13 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 	k2d->inflight     =  0;
     k2d->current_inflight_latency = 0;
     k2d->max_inflight_latency = K2_MAX_INFLIGHT_USECONDS;
-	for (i = 0; i < IOPRIO_BE_NR; i++)
-		INIT_LIST_HEAD(&k2d->rt_reqs[i]);
+	for (i = 0; i < IOPRIO_BE_NR; i++) {
+          INIT_LIST_HEAD(&k2d->rt_reqs[i]);
+          k2d->last_rt_queue_dispatches[i] = 0;
+        }
 
 	INIT_LIST_HEAD(&k2d->be_reqs);
+        k2d->last_be_queue_dispatch = 0;
 
 	k2d->sort_list[READ] = RB_ROOT;
 	k2d->sort_list[WRITE] = RB_ROOT;
@@ -1353,19 +1366,37 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
     spin_unlock_irqrestore(&k2d->lock, flags);
 }
 
+/**
+ * @brief Helper macro that marks a request for dispatching
+ * @details Avoid forgetting setting the last dispatch time
+ */
+#define k2_mark_for_dispatch(__request__, __last_dispatch_time__) \
+        dispatched_rq = (__request__);                            \
+        last_dispatch_dispatched = (__last_dispatch_time__);
+
 static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 {
 	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
-    struct request *rq;
-    struct request* highest_prio_rt_rq = NULL;
-    u8 highest_rt_rq_class = IOPRIO_CLASS_IDLE + 1; // Lowest possible priority class + 1
-    u8 highest_rt_rq_lvl = IOPRIO_NR_LEVELS + 1 ; // Lowest possible priority level + 1
+    struct request *rq = NULL;
+    ktime_t* last_dispatch = NULL;
+    struct request* dispatched_rq = NULL;
+    ktime_t* last_dispatch_dispatched = NULL;
+
     struct list_head* list_elem;
     struct k2_dynamic_rt_rq* rt_rqs;
-	unsigned long flags;
-	unsigned int  i;
+
+    latency_ns_t highest_rq_class = IOPRIO_CLASS_IDLE + 1;  // Lowest possible priority class + 1
+    u8 highest_rq_lvl = IOPRIO_NR_LEVELS + 1 ; // Lowest possible priority level + 1
+
     struct k2_dynamic_rt_rq* next_rt_rqs = NULL;
+    struct k2_dynamic_rt_rq* dispatched_rt_rqs = NULL;
+
+    ktime_t now = k2_now();
+
+    unsigned long flags;
+    unsigned int  i;
+
     K2_LOG(int pid);
 
     K2_LOG(printk(KERN_INFO "k2: Entering dispatch \n"));
@@ -1375,16 +1406,71 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	if (!_k2_has_work(k2d))
 		goto abort;
 
-    /* Periodic realtime requests
-     * Check all realtime queues, and prefer the one with the highest priority
-     * Compare the highest priority to the ones found in the regular static queues
-     * Select the request with the highest priority level, if it does not fit, do not dispatch at all
-     * This creates fairness issues, as the order of search is static
-     * TODO: Find fairness
-     */
+    // Check all queues for starvation
     if (!list_empty(&k2d->rt_dynamic_rqs)) {
         list_for_each(list_elem, &k2d->rt_dynamic_rqs) {
             rt_rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
+            if(!list_empty(&rt_rqs->reqs)) {
+                if (now - rt_rqs->last_dispatch > K2_MAX_QUEUE_WAIT) {
+                    k2_mark_for_dispatch(list_first_entry(&rt_rqs->reqs, struct request, queuelist), &rt_rqs->last_dispatch);
+                    goto end;
+                }
+            }
+        }
+    }
+
+    for (i = 0; i < IOPRIO_BE_NR; i++) {
+        if (!list_empty(&k2d->rt_reqs[i])) {
+            if (now - k2d->last_rt_queue_dispatches[i] > K2_MAX_QUEUE_WAIT) {
+                k2_mark_for_dispatch(list_first_entry(&k2d->rt_reqs[i], struct request, queuelist), &k2d->last_rt_queue_dispatches[i]);
+                goto end;
+            }
+        }
+    }
+
+    if (!list_empty(&k2d->be_reqs)) {
+        k2_mark_for_dispatch(list_first_entry(&k2d->be_reqs, struct request, queuelist), &k2d->last_be_queue_dispatch);
+        goto end;
+    }
+
+
+    // Check regular queues
+
+    // Realtime requests
+    // As the order of static rt queues is descending in priority level,
+    // the search can be aborted after a hit
+    for (i = 0; i < IOPRIO_NR_LEVELS; i++) {
+        if (!list_empty(&k2d->rt_reqs[i])) {
+            rq = list_first_entry(&k2d->rt_reqs[i], struct request, queuelist);
+            last_dispatch = &k2d->last_rt_queue_dispatches[i];
+            highest_rq_class = IOPRIO_CLASS_RT;
+            highest_rq_lvl = i;
+            goto check_registered;
+        }
+    }
+
+    // Best effort requests
+    if (!list_empty(&k2d->be_reqs)) {
+        rq = list_first_entry(&k2d->be_reqs, struct request, queuelist);
+        last_dispatch = &k2d->last_be_queue_dispatch;
+        highest_rq_class = IOPRIO_CLASS_BE;
+    }
+
+    check_registered:
+    /*
+    * Check registered tasks
+    *
+    * Fairness between registered queues of the same priority:
+    * The registered queues are organized in a list structure inside the k2_data.
+    * This list is iterated from front to back on each dispatch
+    * If we encounter a queue with the same or higher priority, favor this one over any previously found queues
+    * If this queue is selected for dispatch, we move the list entry to the front of the list
+    * --> The next time, another queue of the same priority will be selected for dispatch
+    */
+    if (!list_empty(&k2d->rt_dynamic_rqs)) {
+        list_for_each(list_elem, &k2d->rt_dynamic_rqs) {
+            rt_rqs = list_entry(list_elem, struct k2_dynamic_rt_rq, list);
+
             // Get the next deadline of any rt queues
             if (NULL != next_rt_rqs) {
                 if (next_rt_rqs->next_deadline < rt_rqs->next_deadline) {
@@ -1393,100 +1479,68 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
             } else {
                 next_rt_rqs = rt_rqs;
             }
-            // As of k2_insert_request(), there are only BE or RT classes in use here, so this check is valid,
-            // as long as the enum declaration order in the kernel header (ioprio.h) is constant
-            // (IOPRIO_CLASS_RT,
-            //  IOPRIO_CLASS_BE,)
+
             if(!list_empty(&rt_rqs->reqs)) {
-                if (rt_rqs->prio_class <= highest_rt_rq_class) {
-                    if (rt_rqs->prio_lvl < highest_rt_rq_lvl) {
-                        K2_LOG(printk(KERN_INFO "k2: Select new highest prio dynamic dispatch request %pK\n", rq));
+                // Get the realtime request with the highest priority that has the same or a higher priority than any realtime tasks
+                if (rt_rqs->prio_class <= highest_rq_class) {
+                    if (rt_rqs->prio_lvl <= highest_rq_lvl) {
                         K2_LOG(pid = rt_rqs->pid);
                         rq = list_first_entry(&rt_rqs->reqs, struct request, queuelist);
-                        highest_prio_rt_rq = rq;
-                        highest_rt_rq_class = rt_rqs->prio_class;
-                        highest_rt_rq_lvl = rt_rqs->prio_lvl;
+                        last_dispatch = &rt_rqs->last_dispatch;
+                        highest_rq_class = rt_rqs->prio_class;
+                        highest_rq_lvl = rt_rqs->prio_lvl;
+                        dispatched_rt_rqs = rt_rqs;
                     }
                 }
             }
         }
     }
 
-	/* always prefer real-time requests over best effort class requests */
-	for (i = 0; i < IOPRIO_BE_NR; i++) {
-		if (!list_empty(&k2d->rt_reqs[i])) {
-            rq = list_first_entry(&k2d->rt_reqs[i], struct request, queuelist);
-            // If there is a realtime request, compare the rt levels
-            if (highest_rt_rq_class == IOPRIO_CLASS_RT) {
-                // Only schedule realtime request from static queue, if its priority level is higher than the realtime request
-                // As the order of static rt queues is descending in priority level,
-                // the search can be aborted after the first comparison
-                if (highest_rt_rq_lvl > i) {
-                    K2_LOG(printk(KERN_INFO "k2: Select Dispatch request static rt %pK, due to higher prio than any dynamic requests\n",rq));
-                    goto end;
-                } else {
-                    // The dynamic request queue has a higher priority level, dispatch it
-                    K2_LOG(printk(KERN_INFO "k2: Select Dispatch request dynamic rt %pK, pid %d\n", rq, pid));
-                    rq = highest_prio_rt_rq;
-                    goto dynamic_end;
-                }
-            } else {
-                K2_LOG(printk(KERN_INFO "k2: Select Dispatch request static rt %pK\n, no dynamic rt class requests available", rq));
-                // The highest priority class in dynamic queues is BE, schedule the first static RT request available
-                goto dynamic_end;
-            }
-		}
-	}
+    k2_mark_for_dispatch(rq, last_dispatch);
 
-    // If there were no static rt requests available, and the highest priority class in the dynamic queues
-    // is BE, prefer dynamic queues
-    if (NULL != highest_prio_rt_rq) {
-        K2_LOG(printk(KERN_INFO "k2: Select Dispatch request dynamic be %pK, pid %d\n",rq, pid));
-        rq = highest_prio_rt_rq;
+    if (NULL == dispatched_rq) {
+        goto abort;
+    }
+
+    if (NULL != dispatched_rt_rqs) {
+        list_move(&dispatched_rt_rqs->list, &k2d->rt_dynamic_rqs);
         goto dynamic_end;
     }
 
-	/* no rt rqs waiting: choose other workload */
-	if (!list_empty(&k2d->be_reqs)) {
-        K2_LOG(printk(KERN_INFO "k2: Select Dispatch request static be %pK\n",rq));
-        rq = list_first_entry(&k2d->be_reqs, struct request, queuelist);
-        goto end;
-	}
-
-    goto abort;
 
 end:
   // A request from a non registered realtime task has to be checked to interfere with performance goals
   // If it does not fit, no request is dispatched
-    K2_LOG(printk(KERN_INFO "k2: Try Dispatch request %pK\n",rq));
-    k2_set_rq_latency(rq, k2_expected_request_latency(k2d, rq));
-    if (!k2_does_request_fit2(k2d, rq, next_rt_rqs)) {
-        K2_LOG(u16 val = k2_get_rq_schedule_attempts_rt_constraint(rq);
-        if (val > max_retries) {
-            max_retries = val;
-            printk(KERN_INFO "k2: Dispatch request %pK ABORTED, %u, %u, %u, %px\n", rq, val, max_retries, k2_get_rq_pid(rq), rq->elv.priv[1]);
-        })
+    K2_LOG(printk(KERN_INFO "k2: Try Dispatch request %pK\n", dispatched_rq));
+    k2_set_rq_latency(dispatched_rq, k2_expected_request_latency(k2d, dispatched_rq));
+    if (!k2_does_request_fit2(k2d, dispatched_rq, next_rt_rqs)) {
+        K2_LOG(
+            u16 val = k2_get_rq_schedule_attempts_rt_constraint(dispatched_rq);
+            if (val > max_retries) {
+                max_retries = val;
+                printk(KERN_INFO "k2: Dispatch request %pK ABORTED, %u, %u, %u, %px\n", dispatched_rq, val, max_retries, k2_get_rq_pid(dispatched_rq), dispatched_rq->elv.priv[1]);
+            }
+        )
         goto abort;
     }
     goto dispatch;
 
 dynamic_end:
-    // Realtime tasks get scheduled either way
-    k2_set_rq_latency(rq, k2_expected_request_latency(k2d, rq));
+    // Realtime tasks in their deadlines get scheduled either way
+    k2_set_rq_latency(dispatched_rq, k2_expected_request_latency(k2d, dispatched_rq));
 
 dispatch:
-    K2_LOG(printk(KERN_INFO "k2: Dispatch request %pK\n",rq));
-	k2_remove_request(q, rq);
-    k2_add_latency(k2d, rq);
-    rq->rq_flags |= RQF_STARTED;
+    K2_LOG(printk(KERN_INFO "k2: Dispatch request %pK\n", dispatched_rq));
+	k2_remove_request(q, dispatched_rq);
+    k2_add_latency(k2d, dispatched_rq);
+    dispatched_rq->rq_flags |= RQF_STARTED;
+    *last_dispatch_dispatched = k2_now();
 
 	spin_unlock_irqrestore(&k2d->lock, flags);
 
-	return(rq);
+	return(dispatched_rq);
 
 abort:
-  // Latency constraints could not be met
-  K2_LOG(printk(KERN_INFO "k2: Dispatch request %pK ABORTED\n", rq));
     spin_unlock_irqrestore(&k2d->lock, flags);
 
     return(NULL);
