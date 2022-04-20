@@ -30,6 +30,8 @@ source=("k2.c"
         "k2_trace.h"
         "Makefile"
 		"dkms.conf"
+		"ringbuf.h"
+		"dkms_pre_build.sh"
 )
 noextract=()
 md5sums=("SKIP"
@@ -37,13 +39,14 @@ md5sums=("SKIP"
          "SKIP"
          "SKIP"
 		 "SKIP"
+		 "SKIP"
+		 "SKIP"
 )
 validpgpkeys=()
 
 
 package() {
 	mkdir -p "${pkgdir}/usr/src/${_pkgname}-${pkgver}/"
-	install -Dm644 k2.c k2.h k2_trace.h Makefile dkms.conf -t "${pkgdir}/usr/src/${_pkgname}-${pkgver}/"
-	mkdir -p ${pkgdir}/usr/lib/modules/$(uname -r)/build/include/trace/events/
-	cp k2_trace.h "${pkgdir}/usr/lib/modules/$(uname -r)/build/include/trace/events/k2.h"
+	install -Dm644 k2.c k2.h k2_trace.h Makefile dkms.conf ringbuf.h  -t "${pkgdir}/usr/src/${_pkgname}-${pkgver}/"
+	install -Dm744 dkms_pre_build.sh -t "${pkgdir}/usr/src/${_pkgname}-${pkgver}/"
 }
