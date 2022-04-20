@@ -74,21 +74,27 @@ static_assert(K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT < U16_MAX);
 // assumes, pointer with is 64bit
 static_assert(sizeof(void*) == sizeof(u64), "Pointers are required to be 64 bit wide");
 
+#define K2_INTERPOLATION_VAL_COUNT 4U
 
+#define K2_RR_512_LAT  70000
+#define K2_RR_4096_LAT 72000
+#define K2_RR_508K_LAT 546000
+#define K2_RR_2M_LAT   1892000
 
+#define K2_SR_512_LAT  14000
+#define K2_SR_4096_LAT 15000
+#define K2_SR_508K_LAT 158000
+#define K2_SR_2M_LAT   599000
 
+#define K2_RW_512_LAT  15000
+#define K2_RW_4096_LAT 17000
+#define K2_RW_508K_LAT 167000
+#define K2_RW_2M_LAT   641000
 
-#define K2_RR_512_LAT  157161
-#define K2_RR_128K_LAT 622957
-#define K2_RR_508K_LAT 1078027
-
-#define K2_RW_512_LAT  79946
-#define K2_RW_128K_LAT 123646
-#define K2_RW_508K_LAT 254603
-
-#define K2_512  512
-#define K2_128K 131072
-#define K2_508K 520192 // Maximum request size for NVMe devices
+#define K2_SW_512_LAT  14000
+#define K2_SW_4096_LAT 16000
+#define K2_SW_508K_LAT 166000
+#define K2_SW_2M_LAT   643000
 
 /** The initial value for the maximum in-flight latency */
 #define K2_MAX_INFLIGHT_USECONDS K2_RR_508K_LAT * 8
@@ -125,8 +131,30 @@ K2_LOG(u16 max_retries = 0;)
  * ============================ */
 
 /**
- * @brief Global K2 data structure
- * @details This struct is initialized by the scheduler itself exactly once.
+ * @brief The type of a request
+ * @details As we only treat READ and Writes, group all other request types in a separate category
+ */
+enum {
+  K2_REQ_READ,
+  K2_REQ_WRITE,
+  K2_REQ_OTHER,
+};
+
+enum {
+  K2_REQ_SEQ,
+  K2_REQ_RAND,
+};
+
+enum {
+  K2_REQ_512,
+  K2_REQ_4096,
+  K2_REQ_508K,
+  K2_REQ_2M,
+};
+
+/**
+ * @brief Global K2 data structure for one block device
+ * @details This struct is initialized by the scheduler itself exactly once per device.
  *  Parallel modifications to this struct MUST ensure synchronous access provided via the k2_data::lock member
  */
 struct k2_data {
@@ -151,21 +179,11 @@ struct k2_data {
     /* The last accessed start sector - use to detect random io */
     sector_t last_dispatched_sector;
 
-    /* Expected latencies for typical access sizes */
-    /* Random Read */
-    latency_ns_t rr_512_lat;
-    latency_ns_t rr_128K_lat;
-    latency_ns_t rr_508K_lat;
+    u64 block_sizes[K2_INTERPOLATION_VAL_COUNT];
 
+    latency_ns_t expected_latencies [2][2][K2_INTERPOLATION_VAL_COUNT];
 
-
-    /* Random Write */
-    latency_ns_t rw_512_lat;
-    latency_ns_t rw_128K_lat;
-    latency_ns_t rw_508K_lat;
-
-    load_adjust_t write_load_mult;
-    load_adjust_t read_load_mult;
+    load_adjust_t load_mult[2];
 
     struct ringbuf last_read_ratios;
     struct ringbuf last_write_ratios;
@@ -249,15 +267,6 @@ struct k2_dynamic_rt_rq {
     struct list_head list;
 };
 
-/**
- * @brief The type of a request
- * @details As we only treat READ and Writes, group all other request types in a separate category
- */
-enum {
-  K2_REQ_READ,
-  K2_REQ_WRITE,
-  K2_REQ_OTHER,
-};
 
 /* ===============================
  * ===== FUNCTION PROTOTYPES =====
@@ -739,58 +748,53 @@ static u32 k2_get_rq_bytes(struct request* rq);
 static latency_ns_t k2_expected_request_latency(struct k2_data* k2d, struct request* rq)
 {
     const unsigned int rq_size = k2_get_rq_bytes(rq);
-    //unsigned int rq_sectors = blk_rq_sectors(rq);
 
     // Requests that are neither write nor read are not taken into account
     latency_ns_t rq_lat = 0;
     unsigned type = k2_req_type(rq);
+    int access_pattern = K2_REQ_RAND;
+    u64 bytes_diff = 0;
+
+    if (K2_REQ_OTHER == type) {
+      K2_LOG(printk(KERN_INFO "k2: Request is misc: %u", rq->cmd_flags & REQ_OP_MASK));
+      goto end;
+    }
 
 #if K2_ENABLE_ACCESS_PATTERN == 1
-    bool random_access = false;
-    sector_t rq_sector_pos = blk_rq_pos(rq);
-    u64 bytes_diff = abs(rq_sector_pos - k2d->last_dispatched_sector) << SECTOR_SHIFT;
+    bytes_diff = abs(blk_rq_pos(rq) - k2d->last_dispatched_sector) << SECTOR_SHIFT;
 
-    if (bytes_diff > K2_RANDIO_THRESHOLD) {
-      random_access = true;
+    if (bytes_diff < K2_RANDIO_THRESHOLD) {
+      access_pattern = K2_REQ_SEQ;
     }
-    K2_LOG(printk(KERN_ERR "k2: Access is random: %d\n", random_access));
-
+    K2_LOG(printk(KERN_ERR "k2: Access is random: %d\n", access_pattern == K2_REQ_RAND));
 #endif
 
     K2_LOG(printk(KERN_INFO "k2: Request size: %u (%uk), type: %s", rq_size, rq_size >> 10, k2_req_type_names[type]));
 
-    switch (type) {
-        case K2_REQ_READ:
-            if(rq_size <= K2_512) {
-                rq_lat = k2d->rr_512_lat;
-            } else if (rq_size <= K2_128K) {
-                rq_lat = k2_linear_interpolation(rq_size, K2_512, K2_128K, k2d->rr_512_lat, k2d->rr_128K_lat);
-            } else if (rq_size < K2_508K) {
-                rq_lat = k2_linear_interpolation(rq_size, K2_128K, K2_508K, k2d->rr_128K_lat, k2d->rr_508K_lat);
-            } else {
-                rq_lat = k2d->rr_508K_lat;
-            }
-#if K2_ENABLE_LOAD_ADJUST == 1
-            rq_lat = (load_adjust_t)rq_lat * k2d->read_load_mult / K2_LOAD_ADJUST_DEFAULT;
-#endif
-            break;
-        case K2_REQ_WRITE:
-            if(rq_size <= K2_512) {
-                rq_lat = k2d->rw_512_lat;
-            } else if (rq_size <= K2_128K) {
-                rq_lat = k2_linear_interpolation(rq_size, K2_512, K2_128K, k2d->rw_512_lat, k2d->rw_128K_lat);
-            } else if (rq_size < K2_508K) {
-                rq_lat = k2_linear_interpolation(rq_size, K2_128K, K2_508K, k2d->rw_128K_lat, k2d->rw_508K_lat);
-            } else {
-                rq_lat = k2d->rw_508K_lat;
-            }
-#if K2_ENABLE_LOAD_ADJUST == 1
-            rq_lat = (load_adjust_t)rq_lat * k2d->write_load_mult / K2_LOAD_ADJUST_DEFAULT;
-#endif
-            break;
-        default:
-            K2_LOG(printk(KERN_INFO "k2: Request is misc: %u", rq->cmd_flags & REQ_OP_MASK));
+    if (rq_size <= k2d->block_sizes[K2_REQ_512]) {
+      rq_lat = k2d->expected_latencies[type][access_pattern][K2_REQ_512];
+    } else if (rq_size <= k2d->block_sizes[K2_REQ_4096]) {
+      rq_lat = k2_linear_interpolation(rq_size, k2d->block_sizes[K2_REQ_512], k2d->block_sizes[K2_REQ_4096]
+                                       , k2d->expected_latencies[type][access_pattern][K2_REQ_512]
+                                       , k2d->expected_latencies[type][access_pattern][K2_REQ_4096]);
+    } else if (rq_size <= k2d->block_sizes[K2_REQ_508K]) {
+      rq_lat = k2_linear_interpolation(rq_size, k2d->block_sizes[K2_REQ_4096], k2d->block_sizes[K2_REQ_508K]
+                                       , k2d->expected_latencies[type][access_pattern][K2_REQ_4096]
+                                       , k2d->expected_latencies[type][access_pattern][K2_REQ_508K]);
+    } else if (rq_size < k2d->block_sizes[K2_REQ_2M]){
+      rq_lat = k2_linear_interpolation(rq_size, k2d->block_sizes[K2_REQ_508K], k2d->block_sizes[K2_REQ_2M]
+                                       , k2d->expected_latencies[type][access_pattern][K2_REQ_508K]
+                                       , k2d->expected_latencies[type][access_pattern][K2_REQ_2M]);
+    } else {
+      rq_lat = k2d->expected_latencies[type][access_pattern][K2_REQ_2M];
     }
+
+#if K2_ENABLE_LOAD_ADJUST == 1
+    rq_lat = (load_adjust_t)rq_lat * k2d->load_mult[type] / K2_LOAD_ADJUST_DEFAULT;
+#endif
+
+
+end:
     K2_LOG(printk(KERN_INFO "k2: Expected introduced latency: %lld", rq_lat));
     return rq_lat;
 
@@ -1162,16 +1166,33 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
     // The first access will always be a random access
     k2d->last_dispatched_sector = U64_MAX;
 
-    k2d->rr_512_lat = K2_RR_512_LAT;
-    k2d->rr_128K_lat = K2_RR_128K_LAT;
-    k2d->rr_508K_lat = K2_RR_508K_LAT;
+    k2d->block_sizes[K2_REQ_512] = 512;
+    k2d->block_sizes[K2_REQ_4096] = 4096;
+    k2d->block_sizes[K2_REQ_508K] = 508 * 1024;
+    k2d->block_sizes[K2_REQ_2M] = 2048 * 1024;
 
-    k2d->rw_512_lat = K2_RW_512_LAT;
-    k2d->rw_128K_lat = K2_RW_128K_LAT;
-    k2d->rw_508K_lat = K2_RW_508K_LAT;
+    k2d->expected_latencies[K2_REQ_READ][K2_REQ_RAND][K2_REQ_512] = K2_RR_512_LAT;
+    k2d->expected_latencies[K2_REQ_READ][K2_REQ_RAND][K2_REQ_4096] = K2_RR_4096_LAT;
+    k2d->expected_latencies[K2_REQ_READ][K2_REQ_RAND][K2_REQ_508K] = K2_RR_508K_LAT;
+    k2d->expected_latencies[K2_REQ_READ][K2_REQ_RAND][K2_REQ_2M] = K2_RR_2M_LAT;
 
-    k2d->read_load_mult = K2_LOAD_ADJUST_DEFAULT;
-    k2d->write_load_mult = K2_LOAD_ADJUST_DEFAULT;
+    k2d->expected_latencies[K2_REQ_READ][K2_REQ_SEQ][K2_REQ_512] = K2_SR_512_LAT;
+    k2d->expected_latencies[K2_REQ_READ][K2_REQ_SEQ][K2_REQ_4096] = K2_SR_4096_LAT;
+    k2d->expected_latencies[K2_REQ_READ][K2_REQ_SEQ][K2_REQ_508K] = K2_SR_508K_LAT;
+    k2d->expected_latencies[K2_REQ_READ][K2_REQ_SEQ][K2_REQ_2M] = K2_SR_2M_LAT;
+
+    k2d->expected_latencies[K2_REQ_WRITE][K2_REQ_RAND][K2_REQ_512] = K2_RW_512_LAT;
+    k2d->expected_latencies[K2_REQ_WRITE][K2_REQ_RAND][K2_REQ_4096] = K2_RW_4096_LAT;
+    k2d->expected_latencies[K2_REQ_WRITE][K2_REQ_RAND][K2_REQ_508K] = K2_RW_508K_LAT;
+    k2d->expected_latencies[K2_REQ_WRITE][K2_REQ_RAND][K2_REQ_2M] = K2_RW_2M_LAT;
+
+    k2d->expected_latencies[K2_REQ_WRITE][K2_REQ_SEQ][K2_REQ_512] = K2_SW_512_LAT;
+    k2d->expected_latencies[K2_REQ_WRITE][K2_REQ_SEQ][K2_REQ_4096] = K2_SW_4096_LAT;
+    k2d->expected_latencies[K2_REQ_WRITE][K2_REQ_SEQ][K2_REQ_508K] = K2_SW_508K_LAT;
+    k2d->expected_latencies[K2_REQ_WRITE][K2_REQ_SEQ][K2_REQ_2M] = K2_SW_2M_LAT;
+
+    k2d->load_mult[K2_REQ_READ] = K2_LOAD_ADJUST_DEFAULT;
+    k2d->load_mult[K2_REQ_WRITE] = K2_LOAD_ADJUST_DEFAULT;
 
     rb = &k2d->last_read_ratios;
     ringbuf_init(rb, K2_LOAD_ADJUST_WINDOW_LEN, load_adjust_t);
@@ -1680,11 +1701,11 @@ static void k2_completed_request(struct request *rq, u64 watDis)
       switch (k2_req_type(rq)) {
         case K2_REQ_READ:
           rb = &k2d->last_read_ratios;
-          k2_load_adjust_sliding_window(&k2d->read_load_mult, rb, k2_get_rq_latency(rq), real_latency);
+          k2_load_adjust_sliding_window(&k2d->load_mult[K2_REQ_READ], rb, k2_get_rq_latency(rq), real_latency);
           break;
         case K2_REQ_WRITE:
           rb = &k2d->last_write_ratios;
-          k2_load_adjust_sliding_window(&k2d->write_load_mult, rb, k2_get_rq_latency(rq), real_latency);
+          k2_load_adjust_sliding_window(&k2d->load_mult[K2_REQ_WRITE], rb, k2_get_rq_latency(rq), real_latency);
           break;
         default:
           break;
