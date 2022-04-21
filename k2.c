@@ -223,6 +223,9 @@ struct k2_data {
      *  as the number of special request queues is expected to be low
      */
     struct list_head rt_dynamic_rqs;
+
+    ktime_t next_dynamic_deadline;
+    pid_t next_dynamic_deadline_pid;
 };
 
 /**
@@ -674,6 +677,13 @@ static bool _k2_has_work(struct k2_data *k2d)
     unsigned int  i;
     struct list_head* list_elem;
     struct k2_dynamic_rt_rq* rt_rqs;
+    ktime_t now = k2_now();
+
+    // If there is a dynamic queue pending, allow running the queues
+    if (now >= k2d->next_dynamic_deadline) {
+        //printk("Allow registered %lld %lld %lld\n", now, k2d->next_dynamic_deadline, now - k2d->next_dynamic_deadline);
+        return true;
+    }
 
     // If the limit of concurrent request latencies is reached and there are no more "free" requests left, abort
     if (k2d->current_inflight_latency >= k2d->max_inflight_latency
@@ -1069,6 +1079,8 @@ static int k2_del_dynamic_rt_rq(struct k2_data* k2d, pid_t pid) {
             if (rqs->pid == pid) {
                 list_del(list_elem);
                 kfree(rqs);
+                k2d->next_dynamic_deadline = S64_MAX;
+                k2d->next_dynamic_deadline_pid = -1;
                 goto finally;
             }
         }
@@ -1101,6 +1113,8 @@ static int k2_del_all_dynamic_rt_rq(struct k2_data* k2d) {
             list_del(list_elem);
             kfree(rqs);
         }
+        k2d->next_dynamic_deadline = S64_MAX;
+        k2d->next_dynamic_deadline_pid = -1;
     }
 
     spin_unlock_irqrestore(&k2d->lock, flags);
@@ -1229,6 +1243,9 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 
     INIT_LIST_HEAD(&k2d->rt_dynamic_rqs);
 
+    k2d->next_dynamic_deadline = S64_MAX;
+    k2d->next_dynamic_deadline_pid = -1;
+
     // Register this instance so it can be addressed from ioctl
     if(k2_global_k2_dev) {
         list_add_tail(&k2d->global_k2_list_element, &k2_global_k2_dev->k2_instances);
@@ -1346,6 +1363,10 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
                     if (rt_rqs->next_deadline < k2_now()) {
                         //printk(KERN_ERR "Reeeee\n");
                         rt_rqs->next_deadline = ktime_add(k2_now(), rt_rqs->interval);
+                        if (rt_rqs->next_deadline < k2d->next_dynamic_deadline || k2d->next_dynamic_deadline_pid == rt_rqs->pid) {
+                            k2d->next_dynamic_deadline = rt_rqs->next_deadline;
+                            k2d->next_dynamic_deadline_pid = rt_rqs->pid;
+                        }
                     }
 
                     // Enable the next statement to disable any merging attempts for dynamic rt requests
@@ -1512,7 +1533,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
                 //printk(KERN_WARNING "DA IS WAS DRIN!\n");
                 // If the request's deadline is reached, schedule it no matter what
                 if (rt_rqs->next_deadline <= now){
-                    printk(KERN_WARNING "k2: Realtime Deadline %d: %llu, %lld, %lld\n", rt_rqs->pid, rt_rqs->next_deadline, now, rt_rqs->next_deadline - now);
+                    //printk(KERN_WARNING "k2: Realtime Deadline %d: %llu, %lld, %lld\n", rt_rqs->pid, rt_rqs->next_deadline, now, rt_rqs->next_deadline - now);
                     last_dynamic_dispatch = &rt_rqs->last_dispatch;
                     k2_mark_for_dispatch(list_first_entry(&rt_rqs->reqs, struct request, queuelist), last_dynamic_dispatch);
                     dispatched_rt_rqs = rt_rqs;
@@ -1603,6 +1624,10 @@ dispatch:
     if (NULL != dispatched_rt_rqs) {
         list_move(&dispatched_rt_rqs->list, &k2d->rt_dynamic_rqs);
         rt_rqs->next_deadline = ktime_add(k2_now(), rt_rqs->interval);
+        if (rt_rqs->next_deadline < k2d->next_dynamic_deadline || k2d->next_dynamic_deadline_pid == rt_rqs->pid) {
+            k2d->next_dynamic_deadline = rt_rqs->next_deadline;
+            k2d->next_dynamic_deadline_pid = rt_rqs->pid;
+        }
     }
 
 	spin_unlock_irqrestore(&k2d->lock, flags);
