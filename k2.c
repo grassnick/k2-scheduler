@@ -53,6 +53,13 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(k2_completed_request);
 /** Macro to disable Kernel massages meant for debugging */
 #define K2_LOG(log)
 
+/**
+ * @brief Reserve certain percentage for synchronous requests.
+ * @details To avoid starvation for synchronous requests, that are restricted from entering the software queues by the high pressure of incoming asynchronous requests,
+ * we limit the amount of async requests in the software queues. This value is chooses by hand via quick minimal benchmarks and subject for future optimizations.
+ */
+#define K2_ASYNC_PERCENTAGE 30
+
 /** A type that represents the latency of a request */
 typedef ktime_t latency_ns_t;
 #define LATENCY_NS_T_MAX KTIME_MAX
@@ -97,19 +104,19 @@ static_assert(sizeof(void*) == sizeof(u64), "Pointers are required to be 64 bit 
 #define K2_SW_2M_LAT   643000
 
 /** The initial value for the maximum in-flight latency */
-#define K2_MAX_INFLIGHT_USECONDS K2_RR_508K_LAT * 8
+#define K2_MAX_INFLIGHT_USECONDS (K2_RR_508K_LAT * 3)
 
 #define k2_now() ktime_get_ns()
 
 
 // Dynamic load level adjustment related
-#define K2_ENABLE_LOAD_ADJUST 0
+#define K2_ENABLE_LOAD_ADJUST 1
 typedef u64 load_adjust_t;
 
 #define K2_LOAD_ADJUST_WINDOW_LEN 100ULL
 #define K2_LOAD_ADJUST_MULT 1000ULL
-#define K2_LOAD_ADJUST_MULT_MIN 1ULL
-#define K2_LOAD_ADJUST_MULT_MAX (K2_LOAD_ADJUST_MULT * 1000ULL)
+#define K2_LOAD_ADJUST_MULT_MIN 10ULL
+#define K2_LOAD_ADJUST_MULT_MAX (K2_LOAD_ADJUST_MULT * 100ULL)
 #define K2_LOAD_ADJUST_DEFAULT (K2_LOAD_ADJUST_WINDOW_LEN * K2_LOAD_ADJUST_MULT)
 #define K2_LOAD_ADJUST_MAX (K2_LOAD_ADJUST_DEFAULT * K2_LOAD_ADJUST_MULT)
 #define K2_LOAD_ADJUST_MIN 1ULL
@@ -216,6 +223,8 @@ struct k2_data {
 
     /* The request queue this elevator is attached to */
     struct request_queue* rq;
+
+    u32 async_depth;
 
     /**
      * @brief Dynamically generated realtime I/O request queues
@@ -974,22 +983,26 @@ static inline bool k2_does_request_fit(struct k2_data* k2d, struct request* rq) 
 /**
  * @brief Determine if a request can be dispatched with respect to the next upcoming registered realtime task and global scheduling decisions
  */
-static inline bool k2_does_request_fit2(struct k2_data* k2d, struct request* rq, struct k2_dynamic_rt_rq* rt_rqs) {
-    // Check for regular constraints
-    if (k2_does_request_fit(k2d, rq)) {
-        if (NULL == rt_rqs) {
-            // There are no rt queues
-            return true;
-        }
+static inline bool k2_does_request_fit_check_registered_queues(struct k2_data* k2d, struct request* rq, struct k2_dynamic_rt_rq* rt_rqs) {
 
+    bool does_fit;
+    if (k2d->inflight <= K2_MINIMUM_COHERENT_REQUEST_COUNT) {
+        // Do not deadlock when request time exceeds maximum inflight latency
+	    K2_LOG(printk(KERN_INFO "k2: Queue length is lower than throttling threshold, request dispatch accepted!"));
+	    return true;
+    }
+
+	if (NULL != rt_rqs) {
+	    // There are no rt queues
         if (k2_get_rq_latency(rq) + k2_now() <= rt_rqs->next_deadline) {
             // The new request will be completed before the next deadline
-            return true;
+            goto regular_constraints;
         }
         if (k2d->current_inflight_latency + k2_get_rq_latency(rq) + rt_rqs->last_request_latency <= k2d->max_inflight_latency) {
             // The overhead introduced by the new request does not interfere performance goals registered realtime tasks
-            return true;
+            goto regular_constraints;
         }
+        //printk("k2: has work: deadline\n");
 
         // The following code snipped was a quick workaround, where normal, non registered low prio
         // requests would lead to a stall of the processing kernel thread, as they would never be scheduled,
@@ -997,18 +1010,33 @@ static inline bool k2_does_request_fit2(struct k2_data* k2d, struct request* rq,
         // even when there were no outstanding requests
 #if 0
         if (list_empty(&rt_rqs->reqs)) {
-            return true;
-        }
+	    return true;
+	}
 #endif
 #if 1
         // The new solution is to define a maximum number of retries for a request, that was denied because of the next rt deadline
         if (k2_get_rq_schedule_attempts_rt_constraint(rq) >= K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT) {
-            return true;
+            goto regular_constraints;
         }
         k2_increment_rq_attempts_rt_constrain(rq);
+	}
 #endif
+
+regular_constraints:
+    if (k2d->max_inflight_latency > k2d->current_inflight_latency) {
+        does_fit = k2_get_rq_latency(rq) <= k2d->max_inflight_latency - k2d->current_inflight_latency;
+    } else {
+        // Queue limit already exceeded
+        does_fit = false;
     }
-    return false;
+
+    if (!does_fit) {
+        K2_LOG(printk(KERN_INFO "k2: Request dispatch rejected, queue limit would be exceeded!"));
+    } else {
+        K2_LOG(printk(KERN_INFO "k2: Request dispatch accepted!"));
+    }
+
+    return does_fit;
 }
 
 static int k2_add_dynamic_rt_rq(struct k2_data* k2d, pid_t pid, latency_ns_t interval) {
@@ -1302,6 +1330,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
 	unsigned long flags;
+	//printk("k2: TRY Entering insert on pid %d", current->pid);
 
 	spin_lock_irqsave(&k2d->lock, flags);
 
@@ -1313,6 +1342,8 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
         struct list_head* list_item;
         struct list_head* k2_queue;
         struct k2_dynamic_rt_rq* rt_rqs;
+
+	//printk("k2: Entering insert on pid %d", current->pid);
 
         rq = list_first_entry(rqs, struct request, queuelist);
 		list_del_init(&rq->queuelist);
@@ -1435,7 +1466,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
     unsigned long flags;
     unsigned int i;
 
-    K2_LOG(printk(KERN_INFO "k2: Entering dispatch \n"));
+    //printk(KERN_INFO "k2: Entering dispatch \n");
     spin_lock_irqsave(&k2d->lock, flags);
 
     /* Situation might have change since the last call to has_work() */
@@ -1533,7 +1564,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
                 //printk(KERN_WARNING "DA IS WAS DRIN!\n");
                 // If the request's deadline is reached, schedule it no matter what
                 if (rt_rqs->next_deadline <= now){
-                    //printk(KERN_WARNING "k2: Realtime Deadline %d: %llu, %lld, %lld\n", rt_rqs->pid, rt_rqs->next_deadline, now, rt_rqs->next_deadline - now);
+                    printk(KERN_ERR "k2: Realtime Deadline %d: %llu, %lld, %lld\n", rt_rqs->pid, rt_rqs->next_deadline, now, rt_rqs->next_deadline - now);
                     last_dynamic_dispatch = &rt_rqs->last_dispatch;
                     k2_mark_for_dispatch(list_first_entry(&rt_rqs->reqs, struct request, queuelist), last_dynamic_dispatch);
                     dispatched_rt_rqs = rt_rqs;
@@ -1550,7 +1581,9 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
                         dispatched_rt_rqs = rt_rqs;
                     }
                 }
-            }
+	    } else {
+		    //printk(KERN_WARNING "DA IS NIX DRIN!\n");
+	    }
         }
     }
 
@@ -1558,7 +1591,8 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
         goto abort;
     }
 
-    //printk("k2: %d %d; %d %d ", highest_regular_rq_class, highest_dynamic_rq_class, highest_regular_rq_lvl, highest_dynamic_rq_lvl);
+    //if (highest_dynamic_rq_lvl != 9)
+    	//printk("k2: %d %d; %d %d ", highest_regular_rq_class, highest_dynamic_rq_class, highest_regular_rq_lvl, highest_dynamic_rq_lvl);
     if (highest_regular_rq_class < highest_dynamic_rq_class) {
         //printk("k2: dispatch regular 1\n");
         k2_mark_for_dispatch(regular_rq, last_regular_dispatch);
@@ -1596,7 +1630,8 @@ end:
   // If it does not fit, no request is dispatched
     K2_LOG(printk(KERN_INFO "k2: Try Dispatch request %pK\n", dispatched_rq));
     k2_set_rq_latency(dispatched_rq, k2_expected_request_latency(k2d, dispatched_rq));
-    if (!k2_does_request_fit2(k2d, dispatched_rq, next_rt_rqs)) {
+    if (!k2_does_request_fit_check_registered_queues(k2d, dispatched_rq,
+						     next_rt_rqs)) {
         K2_LOG(
             u16 val = k2_get_rq_schedule_attempts_rt_constraint(dispatched_rq);
             if (val > max_retries) {
@@ -1900,6 +1935,91 @@ void k2_prepare_request(struct request* rq)
   k2_set_rq_pid(rq, pid);
 }
 
+/**
+ * @brief Declare required structs
+ * @details For some unknown reason, the structs in the parameter list of elevator functions are not defined in the installed kernel headers,
+ * they are only included in the kernel source tree. 150 IQ moves over here...
+ * We copy the struct definition in order to use the functions offered in the exported headers.
+ *
+ * On some point later in time, these structs might change upstream and things will get ugly.
+ * TODO: Watch out!
+ */
+struct blk_mq_alloc_data {
+    /* input parameter */
+    struct request_queue *q;
+    blk_mq_req_flags_t flags;
+    unsigned int shallow_depth;
+    unsigned int cmd_flags;
+
+    /* input & output parameter */
+    struct blk_mq_ctx *ctx;
+    struct blk_mq_hw_ctx *hctx;
+};
+
+struct blk_mq_tags {
+    unsigned int nr_tags;
+    unsigned int nr_reserved_tags;
+
+    atomic_t active_queues;
+
+    struct sbitmap_queue *bitmap_tags;
+    struct sbitmap_queue *breserved_tags;
+
+    struct sbitmap_queue __bitmap_tags;
+    struct sbitmap_queue __breserved_tags;
+
+    struct request **rqs;
+    struct request **static_rqs;
+    struct list_head page_list;
+
+    /*
+     * used to clear request reference in rqs[] before freeing one
+     * request pool
+     */
+    spinlock_t lock;
+};
+
+
+
+static void k2_depth_updated(struct blk_mq_hw_ctx *hctx)
+{
+    struct request_queue *q = hctx->queue;
+    struct k2_data* k2d = q->elevator->elevator_data;
+    struct blk_mq_tags *tags = hctx->sched_tags;
+    unsigned int shift = tags->bitmap_tags->sb.shift;
+
+    k2d->async_depth = (1U << shift) * K2_ASYNC_PERCENTAGE / 100U;
+    //printk(KERN_ERR "k2: Set async depth to %u\n", k2d->async_depth);
+
+    sbitmap_queue_min_shallow_depth(tags->bitmap_tags, k2d->async_depth);
+}
+
+/**
+ * @brief Set initial async request limit
+ */
+static int k2d_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
+{
+    k2_depth_updated(hctx);
+    return 0;
+}
+
+
+/**
+ * @brief Limit the software queue length for async requests.
+ * @details Synchronous requests will be stalled by the sheer amount of asynchronous request pressure and will fail their performance goals,
+ * simply because the do not get to insert their request to the scheduler.
+ * @param op OpCode of the request
+ */
+static void k2_limit_depth(unsigned int op, struct blk_mq_alloc_data *data)
+{
+    if (!op_is_sync(op)) {
+        struct k2_data *k2d = data->q->elevator->elevator_data;
+        //printk(KERN_ERR "k2: GET async depth to %u\n", k2d->async_depth);
+
+        data->shallow_depth = k2d->async_depth;
+    }
+}
+
 static struct elevator_type k2_iosched = {
 	.ops = {
 		.init_sched        = k2_init_sched,
@@ -1917,6 +2037,10 @@ static struct elevator_type k2_iosched = {
         .next_request		= elv_rb_latter_request,
         .former_request		= elv_rb_former_request,
 		.requests_merged   = k2_requests_merged,
+
+        .limit_depth = k2_limit_depth,
+        .depth_updated = k2_depth_updated,
+        .init_hctx = k2d_init_hctx,
 	},
 	.elevator_attrs = k2_attrs,
 	.elevator_name  = "k2",
