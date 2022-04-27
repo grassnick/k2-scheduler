@@ -1,7 +1,8 @@
 PWD	:= $(shell pwd)
 KDIR	?= /lib/modules/$(shell uname -r)/build
 
-obj-m += k2.o
+k2_legacy-y := k2.o
+obj-m += k2_legacy.o
 
 all: default
 

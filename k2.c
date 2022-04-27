@@ -425,7 +425,7 @@ static struct elevator_type k2_iosched = {
 	},
     //.uses_mq        = true,
 	.elevator_attrs = k2_attrs,
-	.elevator_name  = "k2",
+	.elevator_name  = "k2_legacy",
 	.elevator_owner = THIS_MODULE,
 };
 
