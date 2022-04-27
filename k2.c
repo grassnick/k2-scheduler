@@ -251,7 +251,7 @@ static void k2_ioprio_from_task(int *class, int *value)
 		*value = IOPRIO_NORM;
 	} else {
 		*class = IOPRIO_PRIO_CLASS(current->io_context->ioprio);
-		*value = IOPRIO_PRIO_VALUE(*class, current->io_context->ioprio);
+		*value = IOPRIO_PRIO_DATA(current->io_context->ioprio);
 	}
 }
 
