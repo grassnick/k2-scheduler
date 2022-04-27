@@ -28,6 +28,8 @@
 #include <linux/blk-mq.h>
 #include <linux/ioprio.h>
 
+#include <trace/events/block.h>
+
 /*
  * blk_mq_sched_request_inserted() is EXPORT_SYMBOL_GPL'ed, but it is declared
  * in the header file block/blk-mq-sched.h, which is not part of the installed
@@ -288,14 +290,13 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 		if (prio_class == IOPRIO_CLASS_RT) {
 			if (prio_value >= IOPRIO_BE_NR || prio_value < 0)
 				prio_value = IOPRIO_NORM;
-
+                        trace_block_rq_insert(r);
 			list_add_tail(&r->queuelist, &k2d->rt_reqs[prio_value]);
 		} else {
+                        trace_block_rq_insert(r);
 			list_add_tail(&r->queuelist, &k2d->be_reqs);
 		}
 
-		/* leave a message for tracing */
-		//blk_mq_sched_request_inserted(r);
 	}
 	spin_unlock_irqrestore(&k2d->lock, flags);
 }
