@@ -1342,6 +1342,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
         struct list_head* list_item;
         struct list_head* k2_queue;
         struct k2_dynamic_rt_rq* rt_rqs;
+        ktime_t now;
 
 	//printk("k2: Entering insert on pid %d", current->pid);
 
@@ -1378,6 +1379,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 		}
 
         pid = current->pid;
+        now = k2_now();
 
         // If there exists a dynamic realtime queue for this task, add the request there
         if (!list_empty(&k2d->rt_dynamic_rqs)) {
@@ -1391,9 +1393,9 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
                     rt_rqs->prio_lvl = prio_value;
 
                     //printk("k2: %llu %llu, %llu\n", rt_rqs->next_deadline, k2_now(), rt_rqs->next_deadline - k2_now());
-                    if (rt_rqs->next_deadline < k2_now()) {
+                    if (rt_rqs->next_deadline < now) {
                         //printk(KERN_ERR "Reeeee\n");
-                        rt_rqs->next_deadline = ktime_add(k2_now(), rt_rqs->interval);
+                        rt_rqs->next_deadline = ktime_add(now, rt_rqs->interval);
                         if (rt_rqs->next_deadline < k2d->next_dynamic_deadline || k2d->next_dynamic_deadline_pid == rt_rqs->pid) {
                             k2d->next_dynamic_deadline = rt_rqs->next_deadline;
                             k2d->next_dynamic_deadline_pid = rt_rqs->pid;
@@ -1461,7 +1463,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
     struct k2_dynamic_rt_rq *dispatched_rt_rqs = NULL;
     bool* consider_regular_rq;
 
-    ktime_t now = k2_now();
+    ktime_t now;
 
     unsigned long flags;
     unsigned int i;
@@ -1474,6 +1476,8 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
         //printk(KERN_ERR "k2: no run dispatch!\n");
         goto abort;
     }
+
+    now = k2_now();
 
     // Check all queues for starvation
     if (!list_empty(&k2d->rt_dynamic_rqs)) {
@@ -1846,7 +1850,7 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     unsigned long flags;
     latency_ns_t current_lat;
     latency_ns_t max_lat;
-    latency_ns_t now = k2_now();
+    latency_ns_t now;
     latency_ns_t real_latency = (now >= rq->io_start_time_ns) ? now - (latency_ns_t)rq->io_start_time_ns : 0;
     struct list_head* list_elem;
     struct k2_dynamic_rt_rq* rt_rqs;
@@ -1855,6 +1859,8 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     bool has_work;
 
     spin_lock_irqsave(&k2d->lock, flags);
+
+    now = k2_now();
 
     current_lat = k2d->current_inflight_latency;
     max_lat = k2d->max_inflight_latency;
