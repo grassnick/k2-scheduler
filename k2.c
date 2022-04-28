@@ -69,11 +69,11 @@ typedef ktime_t timepoint_ns_t;
 #define TIMEPOINT_NS_T_MAX KTIME_MAX
 
 /** The number of requests that can always be in flight, needs to be > 0, else scheduler might stall */
-#define K2_MINIMUM_COHERENT_REQUEST_COUNT 4U
+#define K2_MINIMUM_COHERENT_REQUEST_COUNT 2U
 static_assert(K2_MINIMUM_COHERENT_REQUEST_COUNT > 0);
 static_assert(K2_MINIMUM_COHERENT_REQUEST_COUNT < U64_MAX);
 
-#define K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT 8U
+#define K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT 64U
 static_assert(K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT > 0);
 static_assert(K2_REQUEST_RETRY_COUNT_RT_CONSTRAINT < U16_MAX);
 
@@ -104,7 +104,7 @@ static_assert(sizeof(void*) == sizeof(u64), "Pointers are required to be 64 bit 
 #define K2_SW_2M_LAT   643000
 
 /** The initial value for the maximum in-flight latency */
-#define K2_MAX_INFLIGHT_USECONDS (K2_RR_508K_LAT * 3)
+#define K2_MAX_INFLIGHT_USECONDS (K2_RR_508K_LAT * 4)
 
 #define k2_now() ktime_get_ns()
 
@@ -755,7 +755,7 @@ static latency_ns_t k2_linear_interpolation(const u32 val
 
 }
 
-static void k2_load_adjust_sliding_window(load_adjust_t* mult, struct ringbuf* rb, load_adjust_t estimated_latency, load_adjust_t real_latency)
+static void k2_load_adjust_sliding_window(load_adjust_t* mult, struct ringbuf* rb, latency_ns_t estimated_latency, latency_ns_t real_latency)
 {
   load_adjust_t last_ratio;
   K2_LOG(load_adjust_t old_mult = *mult;)
@@ -767,7 +767,7 @@ static void k2_load_adjust_sliding_window(load_adjust_t* mult, struct ringbuf* r
   // Undo operation that is no longer valid
   ringbuf_pushback(rb, new_ratio, last_ratio, load_adjust_t);
   *mult -= last_ratio;
-  K2_LOG(printk("k2: OLD: %llu, NEW: %llu: %llu estimated: %lld, real: %lld last_ratio: %llu, new_ratio %llu, %llu\n", old_mult, *mult, *(mult)/K2_LOAD_ADJUST_DEFAULT, estimated_latency, real_latency, last_ratio, new_ratio, new_ratio / K2_LOAD_ADJUST_MULT);)
+  //printk("k2: OLD: %llu, NEW: %llu: %llu estimated: %lld, real: %lld last_ratio: %llu, new_ratio %llu, %llu\n", last_ratio, *mult, *(mult)/K2_LOAD_ADJUST_DEFAULT, estimated_latency, real_latency, last_ratio, new_ratio, new_ratio / K2_LOAD_ADJUST_MULT);
 }
 
 static u32 k2_get_rq_bytes(struct request* rq);
@@ -1851,7 +1851,7 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     latency_ns_t current_lat;
     latency_ns_t max_lat;
     latency_ns_t now;
-    latency_ns_t real_latency = (now >= rq->io_start_time_ns) ? now - (latency_ns_t)rq->io_start_time_ns : 0;
+    latency_ns_t real_latency;
     struct list_head* list_elem;
     struct k2_dynamic_rt_rq* rt_rqs;
     unsigned inflight;
@@ -1861,6 +1861,7 @@ static void k2_completed_request(struct request *rq, u64 watDis)
     spin_lock_irqsave(&k2d->lock, flags);
 
     now = k2_now();
+    real_latency = (now >= rq->io_start_time_ns) ? now - (latency_ns_t)rq->io_start_time_ns : 0;
 
     current_lat = k2d->current_inflight_latency;
     max_lat = k2d->max_inflight_latency;
