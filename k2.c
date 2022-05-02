@@ -1144,6 +1144,7 @@ k2_does_request_fit_check_registered_queues(struct k2_data *k2d,
 			goto regular_constraints;
 		}
 		k2_increment_rq_attempts_rt_constrain(rq);
+		return false;
 	}
 #endif
 
