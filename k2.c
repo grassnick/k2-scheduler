@@ -369,12 +369,12 @@ struct k2_dev {
 	struct cdev cdev;
 
 	/**
-     * @brief device not handle for registration on /dev
+     * @brief Device node handle for registration on /dev
      */
 	struct device *device;
 
 	/**
-     * @brief list of running instances of the scheduler per gendisk
+     * @brief List of running instances of the scheduler per gendisk
      */
 	struct list_head k2_instances;
 
@@ -667,6 +667,9 @@ static const char *k2_req_type_names[] = {
 	[K2_REQ_OTHER] = "OTHER",
 };
 
+/**
+ * @brief Get the access type of a request
+ */
 static inline unsigned int k2_req_type(struct request *rq)
 {
 	switch (req_op(rq) & REQ_OP_MASK) {
@@ -707,6 +710,9 @@ static inline void k2_del_rq_rb(struct k2_data *k2d, struct request *rq)
 	elv_rb_del(k2_rb_root(k2d, rq), rq);
 }
 
+/**
+ * @brief Get the io prio of a task by either its ionice or regular nice value
+ */
 static void k2_ioprio_from_task(int *class, int *value)
 {
 	if (current->io_context == NULL ||
@@ -719,6 +725,11 @@ static void k2_ioprio_from_task(int *class, int *value)
 	}
 }
 
+/**
+ * @brief Check if the scheduler has possibly work to do.
+ * @details This does not mean, it will actually dispatch a request on the next k2_dispatch_request() invokation.
+ * Further restrictions are applied in the dispatch function itself.
+ */
 static bool _k2_has_work(struct k2_data *k2d)
 {
 	unsigned int i;
@@ -770,6 +781,9 @@ static bool _k2_has_work(struct k2_data *k2d)
 	return (false);
 }
 
+/**
+ * @brief Remove a request from the scheduler internal rb tree for back merges.
+ */
 static void k2_remove_request(struct request_queue *q, struct request *r)
 {
 	struct k2_data *k2d = q->elevator->elevator_data;
@@ -787,6 +801,15 @@ static void k2_remove_request(struct request_queue *q, struct request *r)
 		q->last_merge = NULL;
 }
 
+/**
+ * @brief Linearly interpolate the latency of a request based on its size (value) between two predefined values
+ * @param val The value to get the interpolated latency for
+ * @param lower_val The next smaller value with a associated latency
+ * @param upper_val The next higher value with a assocuated latency
+ * @param lower_lat The latency associated with @param lower_val
+ * @param upper_lat The latency associated with @param upper_val
+ * @return The interpolated latency for the requestes value
+ */
 static latency_ns_t k2_linear_interpolation(const u32 val, const u32 lower_val,
 					    const u32 upper_val,
 					    const latency_ns_t lower_lat,
@@ -799,6 +822,15 @@ static latency_ns_t k2_linear_interpolation(const u32 val, const u32 lower_val,
 	return lower_lat + diff_lat * value_percentage / 100;
 }
 
+/**
+ * @brief Perform dynamic device load adoptions for expected request latencies
+ * @details K2 keeps a history of the ratios of expected to real latencies of the latest K2_LOAD_ADJUST_WINDOW_LEN requests that where dispatched to the device.
+ * Once a request is finished, the new ratio is inserted to the ringbuffer, while the oldest one is released, both modifying the global device load multiplier.
+ * @param mult The current load multiplier
+ * @param rb The ring buffer associated with the load multiplier
+ * @param estimated_latency The real latency of the request to register
+ * @param real_latency  The previously estimated latency of the request to register
+ */
 static void k2_load_adjust_sliding_window(load_adjust_t *mult,
 					  struct ringbuf *rb,
 					  latency_ns_t estimated_latency,
@@ -1136,6 +1168,13 @@ regular_constraints:
 	return does_fit;
 }
 
+/**
+ * @brief Add a new dynamic queue for a registered task
+ * @param k2d The k2d this queue belongs to
+ * @param pid The pid of the registered task
+ * @param interval The request submission interval as registered by userspace
+ * @return 0 on success, else error code
+ */
 static int k2_add_dynamic_rt_rq(struct k2_data *k2d, pid_t pid,
 				latency_ns_t interval)
 {
@@ -1191,6 +1230,12 @@ finally:
 	return error;
 }
 
+/**
+ * @brief Delete an existing dynamic queue for a registered task
+ * @param k2d The k2d this queue belongs to
+ * @param pid The pid of the registered task
+ * @return 0 on success, else error code
+ */
 static int k2_del_dynamic_rt_rq(struct k2_data *k2d, pid_t pid)
 {
 	struct k2_dynamic_rt_rq *rqs;
@@ -1224,6 +1269,11 @@ finally:
 	return error;
 }
 
+/**
+ * @brief Delete all dynamic queues for a device
+ * @param k2d The k2d of the device
+ * @return 0 on success, else error code
+ */
 static int k2_del_all_dynamic_rt_rq(struct k2_data *k2d)
 {
 	struct k2_dynamic_rt_rq *rqs;
