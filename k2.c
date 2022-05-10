@@ -1144,6 +1144,7 @@ k2_does_request_fit_check_registered_queues(struct k2_data *k2d,
 			goto regular_constraints;
 		}
 		k2_increment_rq_attempts_rt_constrain(rq);
+		return false;
 	}
 #endif
 
@@ -2304,17 +2305,17 @@ static struct elevator_type k2_iosched = {
 		.dispatch_request  = k2_dispatch_request,
 		.completed_request = k2_completed_request,
 
-        .allow_merge       = k2_allow_merge,
-        .bio_merge         = k2_bio_merge,
+		.allow_merge       = k2_allow_merge,
+		.bio_merge         = k2_bio_merge,
 		.request_merge     = k2_request_merge,
 		.request_merged    = k2_request_merged,
-        .next_request		= elv_rb_latter_request,
-        .former_request		= elv_rb_former_request,
+		.next_request		= elv_rb_latter_request,
+		.former_request		= elv_rb_former_request,
 		.requests_merged   = k2_requests_merged,
 
-        .limit_depth = k2_limit_depth,
-        .depth_updated = k2_depth_updated,
-        .init_hctx = k2d_init_hctx,
+		.limit_depth = k2_limit_depth,
+		.depth_updated = k2_depth_updated,
+		.init_hctx = k2d_init_hctx,
 	},
 	.elevator_attrs = k2_attrs,
 	.elevator_name  = "k2",
