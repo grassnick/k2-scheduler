@@ -1630,7 +1630,11 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx,
 		// As of the documentation, this should be called "immediately before block operation request @rq is inserted
 		// into queue @q"
 		trace_block_rq_insert(rq);
-		list_add_tail(&rq->queuelist, k2_queue);
+		if (at_head) {
+			list_add(&rq->queuelist, k2_queue);
+		} else {
+			list_add_tail(&rq->queuelist, k2_queue);
+		}
 	}
 	spin_unlock_irqrestore(&k2d->lock, flags);
 }
