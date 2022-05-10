@@ -2106,13 +2106,12 @@ static void k2_requests_merged(struct request_queue *q, struct request *rq,
 	spin_unlock_irqrestore(&k2d->lock, flags);
 }
 
-static void k2_completed_request(struct request *rq, u64 watDis)
+static void k2_completed_request(struct request *rq, u64 now)
 {
 	struct k2_data *k2d = rq->q->elevator->elevator_data;
 	unsigned long flags;
 	latency_ns_t current_lat;
 	latency_ns_t max_lat;
-	latency_ns_t now;
 	latency_ns_t real_latency;
 	struct list_head *list_elem;
 	struct k2_dynamic_rt_rq *rt_rqs;
@@ -2122,7 +2121,6 @@ static void k2_completed_request(struct request *rq, u64 watDis)
 
 	spin_lock_irqsave(&k2d->lock, flags);
 
-	now = k2_now();
 	real_latency = (now >= rq->io_start_time_ns) ?
 			       now - (latency_ns_t)rq->io_start_time_ns :
 			       0;
