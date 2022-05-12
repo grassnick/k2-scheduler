@@ -1915,11 +1915,11 @@ dispatch:
 
 	if (NULL != dispatched_rt_rqs) {
 		list_move(&dispatched_rt_rqs->list, &k2d->rt_dynamic_rqs);
-		rt_rqs->next_deadline = ktime_add(k2_now(), rt_rqs->interval);
-		if (rt_rqs->next_deadline < k2d->next_dynamic_deadline ||
-		    k2d->next_dynamic_deadline_pid == rt_rqs->pid) {
-			k2d->next_dynamic_deadline = rt_rqs->next_deadline;
-			k2d->next_dynamic_deadline_pid = rt_rqs->pid;
+		dispatched_rt_rqs->next_deadline = ktime_add(k2_now(), dispatched_rt_rqs->interval);
+		if (dispatched_rt_rqs->next_deadline < k2d->next_dynamic_deadline ||
+		    k2d->next_dynamic_deadline_pid == dispatched_rt_rqs->pid) {
+			k2d->next_dynamic_deadline = dispatched_rt_rqs->next_deadline;
+			k2d->next_dynamic_deadline_pid = dispatched_rt_rqs->pid;
 		}
 	}
 
