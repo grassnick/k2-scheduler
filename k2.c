@@ -183,43 +183,104 @@ struct k2_data {
      */
 	latency_ns_t max_inflight_latency;
 
-	/* The last accessed start sector - use to detect random io */
+	/**
+	 * @brief The sector, the last request was dispatched to
+	 * @details This information is used to determine for new request, if a sequential or a random access is performed
+	*/
 	sector_t last_dispatched_sector;
 
+	/**
+	 * @brief The available block sizes for interpolation
+	*/
 	u64 block_sizes[K2_INTERPOLATION_VAL_COUNT];
 
+	/**
+	 * @brief Predefined request latencies
+	 * @details Dimensions include
+	 * 	* The operation type of the request (read/write)
+	 *  * The access pattern of the request (sequential/random)
+	 *  * The size of the request (as defined in block_sizes)
+	*/
 	latency_ns_t expected_latencies[2][2][K2_INTERPOLATION_VAL_COUNT];
 
+	/**
+	 * @brief The current load multiplier for read and write requests
+	*/
 	load_adjust_t load_mult[2];
 
+	/**
+	 * @brief Ringbuffer that keeps track of the latest K2_LOAD_ADJUST_WINDOW_LEN completed requests for read operations
+	 * @details Each entry contains the ratio expected latency - real latency
+	*/
 	struct ringbuf last_read_ratios;
+
+	/**
+	 * @brief Ringbuffer that keeps track of the latest K2_LOAD_ADJUST_WINDOW_LEN completed requests for read operations
+	 * @details Each entry contains the ratio expected latency - real latency
+	*/
 	struct ringbuf last_write_ratios;
 
-	/* further group real-time requests by I/O priority */
+	/**
+	 * @brief Request queues (FIFO) for the realtime I/O priority class
+	 * @details Offer separate request queues for each priority value of the realtime class
+	*/
 	struct list_head rt_reqs[IOPRIO_BE_NR];
+
+	/**
+	 * @brief Request queues (FIFO) for the best effort I/O priority class
+	 * @details Offer a single request queue for all priority values of the best effort class.
+	 * This queue also contains all request of all remaing io priority classes like IDLE.
+	*/
 	struct list_head be_reqs;
 
+	/**
+	 * @brief Timestamps of the latest dispatch for each realtime priority request queue
+	 * @details Used for fairness aspect - Each queue gets to dispatch atleast once every K2_MAX_QUEUE_WAIT ns.
+	 */
 	ktime_t last_rt_queue_dispatches[IOPRIO_BE_NR];
+
+	/**
+	 * @brief Timestamps of the latest dispatch for the best effort request queue
+	 * @details Used for fairness aspect - Each queue gets to dispatch atleast once every K2_MAX_QUEUE_WAIT ns.
+	 */
 	ktime_t last_be_queue_dispatch;
 
+	/**
+	 * @brief True if a regular realtime queue (the ones statically created in K2) got to dispatch last. False if a registered task queue got to dispatch last.
+	 * @details This information is used to perform round robin arbitration for request queues of the different priority.
+	*/
 	bool scheduled_regular_rt_queue_last[IOPRIO_BE_NR];
+
+	/**
+	 * @brief True if the regular best effort queue (the one statically allocated in K2) got to dispatch last. False if a registered task queue got to dispatch last.
+	 * @details This information is used to perform round robin arbitration for request queues of the different priority.
+	*/
 	bool scheduled_regular_be_queue_last;
 
-	/* Sector-ordered lists for request merging
-	 * Request merging currently spans across different priorities,
-	 * this might interfere with latency constraints
-	 * TODO: Separate merging per queue
-	 */
+	/**
+	 * @brief Sector-ordered red-black tree for request merging
+	*/
 	struct rb_root sort_list[2];
 
+	/**
+	 * @brief Global lock for all operations that access this global K2 data struct
+	*/
 	spinlock_t lock;
 
-	/* Collect k2_data structs for different gendisks in the global struct */
+	/**
+	 * @brief List head to queue the K2 data for a specific gendisk (=block device) in the global K2 device struct used for interaction with userspace via IOCTL.
+	*/
 	struct list_head global_k2_list_element;
 
-	/* The request queue this elevator is attached to */
+	/**
+	 * @brief The request queue (=block device) this K2 data is managing.
+	 */
 	struct request_queue *rq;
 
+	/**
+	 * @brief The queue length for asynchronously issued requests.
+	 * @details K2 limits the amount of asynchronously issued requests to avoid starvation of synchronous operations.
+	*/
 	u32 async_depth;
 
 	/**
@@ -229,7 +290,14 @@ struct k2_data {
      */
 	struct list_head rt_dynamic_rqs;
 
+	/**
+	 * @brief The timestamp of the next deadline for all registered tasks
+	*/
 	ktime_t next_dynamic_deadline;
+
+	/**
+	 * @brief The pid of the process of the next upcoming deadline for all registered tasks
+	*/
 	pid_t next_dynamic_deadline_pid;
 };
 
@@ -274,6 +342,10 @@ struct k2_dynamic_rt_rq {
       */
 	latency_ns_t last_request_latency;
 
+	/**
+	 * @brief The timestamp of the last dispatch for this queue
+	 * @details Used for fairness aspect - Each queue gets to dispatch atleast once every K2_MAX_QUEUE_WAIT ns.
+	*/
 	ktime_t last_dispatch;
 
 	/**
