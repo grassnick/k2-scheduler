@@ -1868,7 +1868,6 @@ check_registered:
 			}
 
 			if (!list_empty(&rt_rqs->reqs)) {
-				//printk(KERN_WARNING "DA IS WAS DRIN!\n");
 				// If the request's deadline is reached, schedule it no matter what
 				if (rt_rqs->next_deadline <= now) {
 					printk(KERN_ERR
@@ -1906,7 +1905,6 @@ check_registered:
 					}
 				}
 			} else {
-				//printk(KERN_WARNING "DA IS NIX DRIN!\n");
 			}
 		}
 	}
@@ -1915,8 +1913,6 @@ check_registered:
 		goto abort;
 	}
 
-	//if (highest_dynamic_rq_lvl != 9)
-	//printk("k2: %d %d; %d %d ", highest_regular_rq_class, highest_dynamic_rq_class, highest_regular_rq_lvl, highest_dynamic_rq_lvl);
 	if (highest_regular_rq_class < highest_dynamic_rq_class) {
 		//printk("k2: dispatch regular 1\n");
 		k2_mark_for_dispatch(regular_rq, last_regular_dispatch);
