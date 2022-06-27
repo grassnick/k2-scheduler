@@ -2205,7 +2205,7 @@ static void k2_completed_request(struct request *rq, u64 now)
 
 	real_latency = (now >= rq->io_start_time_ns) ?
 			       now - (latency_ns_t)rq->io_start_time_ns :
-			       0;
+				     0;
 
 	current_lat = k2d->current_inflight_latency;
 	max_lat = k2d->max_inflight_latency;
@@ -2397,13 +2397,13 @@ static struct elevator_type k2_iosched = {
 		.bio_merge         = k2_bio_merge,
 		.request_merge     = k2_request_merge,
 		.request_merged    = k2_request_merged,
-		.next_request		= elv_rb_latter_request,
-		.former_request		= elv_rb_former_request,
+		.next_request      = elv_rb_latter_request,
+		.former_request	   = elv_rb_former_request,
 		.requests_merged   = k2_requests_merged,
 
-		.limit_depth = k2_limit_depth,
-		.depth_updated = k2_depth_updated,
-		.init_hctx = k2d_init_hctx,
+		.limit_depth       = k2_limit_depth,
+		.depth_updated     = k2_depth_updated,
+		.init_hctx         = k2d_init_hctx,
 	},
 	.elevator_attrs = k2_attrs,
 	.elevator_name  = "k2",
