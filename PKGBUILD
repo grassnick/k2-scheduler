@@ -6,7 +6,7 @@
 # Maintainer: Your Name <youremail@domain.com>
 pkgname=k2-scheduler-dkms
 _pkgname=k2-scheduler
-pkgver=0.1
+pkgver=0.2
 pkgrel=1
 epoch=
 pkgdesc="The K2 scheduler for linux"

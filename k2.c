@@ -2438,4 +2438,4 @@ module_exit(k2_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Till Miemietz, Georg Grassnick");
 MODULE_DESCRIPTION("A work-constraining I/O scheduler with real-time notion.");
-MODULE_VERSION("0.1");
+MODULE_VERSION("0.2");
