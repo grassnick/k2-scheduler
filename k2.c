@@ -811,7 +811,9 @@ static bool _k2_has_work(struct k2_data *k2d)
 
 	// If there is a dynamic queue pending, allow running the queues
 	if (now >= k2d->next_dynamic_deadline) {
-		//printk("Allow registered %lld %lld %lld\n", now, k2d->next_dynamic_deadline, now - k2d->next_dynamic_deadline);
+		K2_LOG(printk("Allow registered %lld %lld %lld\n", now,
+			      k2d->next_dynamic_deadline,
+			      now - k2d->next_dynamic_deadline);)
 		return true;
 	}
 
@@ -920,7 +922,6 @@ static void k2_load_adjust_sliding_window(load_adjust_t *mult,
 	// Undo operation that is no longer valid
 	ringbuf_pushback(rb, new_ratio, last_ratio, load_adjust_t);
 	*mult -= last_ratio;
-	//printk("k2: OLD: %llu, NEW: %llu: %llu estimated: %lld, real: %lld last_ratio: %llu, new_ratio %llu, %llu\n", last_ratio, *mult, *(mult)/K2_LOAD_ADJUST_DEFAULT, estimated_latency, real_latency, last_ratio, new_ratio, new_ratio / K2_LOAD_ADJUST_MULT);
 }
 
 static u32 k2_get_rq_bytes(struct request *rq);
@@ -953,7 +954,7 @@ static latency_ns_t k2_expected_request_latency(struct k2_data *k2d,
 	if (bytes_diff < K2_RANDIO_THRESHOLD) {
 		access_pattern = K2_REQ_SEQ;
 	}
-	K2_LOG(printk(KERN_ERR "k2: Access is random: %d\n",
+	K2_LOG(printk(KERN_INFO "k2: Access is random: %d\n",
 		      access_pattern == K2_REQ_RAND));
 #endif
 
@@ -1198,7 +1199,7 @@ k2_does_request_fit_check_registered_queues(struct k2_data *k2d,
 			// The overhead introduced by the new request does not interfere performance goals registered realtime tasks
 			goto regular_constraints;
 		}
-		//printk("k2: has work: deadline\n");
+		K2_LOG(printk("k2: has work: deadline\n");)
 
 		// The following code snipped was a quick workaround, where normal, non registered low prio
 		// requests would lead to a stall of the processing kernel thread, as they would never be scheduled,
@@ -1582,7 +1583,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx,
 	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
 	unsigned long flags;
-	//printk("k2: TRY Entering insert on pid %d", current->pid);
+	K2_LOG(printk("k2: TRY Entering insert on pid %d", current->pid);)
 
 	spin_lock_irqsave(&k2d->lock, flags);
 
@@ -1596,14 +1597,19 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx,
 		struct k2_dynamic_rt_rq *rt_rqs;
 		ktime_t now;
 
-		//printk("k2: Entering insert on pid %d", current->pid);
+		K2_LOG(printk("k2: Entering insert on pid %d", current->pid);)
 
 		rq = list_first_entry(rqs, struct request, queuelist);
 		list_del_init(&rq->queuelist);
 
 		k2_prepare_request(rq);
 
-		//printk(KERN_WARNING "k2: Insert %s REQ: size: %u (%u K), offset %llu, segments: %u  || BIO: how many bio bio_vecs %u \n", k2_req_type_names[k2_req_type(rq)], blk_rq_bytes(rq), blk_rq_bytes(rq) >> 10, blk_rq_pos(rq), blk_rq_nr_phys_segments(rq) , rq->bio->bi_vcnt);
+		K2_LOG(printk(KERN_WARNING
+			      "k2: Insert %s REQ: size: %u (%u K), offset %llu, segments: %u  || BIO: how many bio bio_vecs %u \n",
+			      k2_req_type_names[k2_req_type(rq)],
+			      blk_rq_bytes(rq), blk_rq_bytes(rq) >> 10,
+			      blk_rq_pos(rq), blk_rq_nr_phys_segments(rq),
+			      rq->bio->bi_vcnt);)
 
 		/* if task has no io prio, derive it from its nice value */
 		if (ioprio_valid(rq->ioprio)) {
@@ -1633,6 +1639,11 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx,
 		pid = current->pid;
 		now = k2_now();
 
+		K2_LOG(printk(KERN_INFO
+			      "Insert: PID: %d, class: %d, level: %d, size: %u \n",
+			      pid, prio_class, prio_value,
+			      k2_get_rq_bytes(rq) / 1024);)
+
 		// If there exists a dynamic realtime queue for this task, add the request there
 		if (!list_empty(&k2d->rt_dynamic_rqs)) {
 			list_for_each (list_item, &k2d->rt_dynamic_rqs) {
@@ -1650,7 +1661,6 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx,
 
 					//printk("k2: %llu %llu, %llu\n", rt_rqs->next_deadline, k2_now(), rt_rqs->next_deadline - k2_now());
 					if (rt_rqs->next_deadline < now) {
-						//printk(KERN_ERR "Reeeee\n");
 						rt_rqs->next_deadline = ktime_add(
 							now, rt_rqs->interval);
 						if (rt_rqs->next_deadline <
@@ -1752,12 +1762,11 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	unsigned long flags;
 	unsigned int i;
 
-	//printk(KERN_INFO "k2: Entering dispatch \n");
 	spin_lock_irqsave(&k2d->lock, flags);
 
 	/* Situation might have change since the last call to has_work() */
 	if (!_k2_has_work(k2d)) {
-		//printk(KERN_ERR "k2: no run dispatch!\n");
+		K2_LOG(printk(KERN_INFO "k2: no run dispatch!\n");)
 		goto abort;
 	}
 
@@ -1777,7 +1786,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 								 queuelist),
 						&rt_rqs->last_dispatch);
 					dispatched_rt_rqs = rt_rqs;
-					printk(KERN_ERR
+					printk(KERN_INFO
 					       "k2: Dispatch to prevent starvation dyn\n");
 					goto end;
 				}
@@ -1794,7 +1803,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 							 struct request,
 							 queuelist),
 					&k2d->last_rt_queue_dispatches[i]);
-				printk(KERN_ERR
+				printk(KERN_INFO
 				       "k2: Dispatch to prevent starvation rt\n");
 				goto end;
 			}
@@ -1807,7 +1816,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 							      struct request,
 							      queuelist),
 					     &k2d->last_be_queue_dispatch);
-			printk(KERN_ERR
+			printk(KERN_INFO
 			       "k2: Dispatch to prevent starvation be\n");
 			goto end;
 		}
@@ -1870,7 +1879,7 @@ check_registered:
 			if (!list_empty(&rt_rqs->reqs)) {
 				// If the request's deadline is reached, schedule it no matter what
 				if (rt_rqs->next_deadline <= now) {
-					printk(KERN_ERR
+					printk(KERN_INFO
 					       "k2: Realtime Deadline %d: %llu, %lld, %lld\n",
 					       rt_rqs->pid,
 					       rt_rqs->next_deadline, now,
@@ -1975,7 +1984,8 @@ dynamic_end:
 			  k2_expected_request_latency(k2d, dispatched_rq));
 
 dispatch:
-	//printk(KERN_INFO "k2: Dispatch request %pK, %d\n", dispatched_rq, k2_get_rq_pid(dispatched_rq));
+	K2_LOG(printk(KERN_INFO "k2: Dispatch request %pK, %d\n", dispatched_rq,
+		      k2_get_rq_pid(dispatched_rq));)
 	k2_remove_request(q, dispatched_rq);
 	k2_add_latency(k2d, dispatched_rq);
 	dispatched_rq->rq_flags |= RQF_STARTED;
@@ -1983,10 +1993,13 @@ dispatch:
 
 	if (NULL != dispatched_rt_rqs) {
 		list_move(&dispatched_rt_rqs->list, &k2d->rt_dynamic_rqs);
-		dispatched_rt_rqs->next_deadline = ktime_add(k2_now(), dispatched_rt_rqs->interval);
-		if (dispatched_rt_rqs->next_deadline < k2d->next_dynamic_deadline ||
+		dispatched_rt_rqs->next_deadline =
+			ktime_add(k2_now(), dispatched_rt_rqs->interval);
+		if (dispatched_rt_rqs->next_deadline <
+			    k2d->next_dynamic_deadline ||
 		    k2d->next_dynamic_deadline_pid == dispatched_rt_rqs->pid) {
-			k2d->next_dynamic_deadline = dispatched_rt_rqs->next_deadline;
+			k2d->next_dynamic_deadline =
+				dispatched_rt_rqs->next_deadline;
 			k2d->next_dynamic_deadline_pid = dispatched_rt_rqs->pid;
 		}
 	}
@@ -1997,7 +2010,7 @@ dispatch:
 
 abort:
 	spin_unlock_irqrestore(&k2d->lock, flags);
-	//printk("k2: Aborted\n");
+	K2_LOG(printk("k2: Dispatch aborted\n");)
 
 	return (NULL);
 }
@@ -2114,7 +2127,7 @@ static int k2_request_merge(struct request_queue *q, struct request **rq,
 		// Checks k2_allow_merge
 		if (elv_bio_merge_ok(__rq, bio)) {
 			*rq = __rq;
-			K2_LOG(printk(KERN_ERR
+			K2_LOG(printk(KERN_INFO
 				      "k2 Did a request front merge\n"));
 			return (ELEVATOR_FRONT_MERGE);
 		}
@@ -2134,7 +2147,7 @@ static void k2_request_merged(struct request_queue *q, struct request *rq,
 {
 	struct k2_data *k2d = q->elevator->elevator_data;
 
-	K2_LOG(printk(KERN_ERR "k2: Entering k2_request_merged\n"));
+	K2_LOG(printk(KERN_INFO "k2: Entering k2_request_merged\n"));
 
 	/*
 	 * if the merge was a front merge, we need to reposition request
@@ -2202,8 +2215,13 @@ static void k2_completed_request(struct request *rq, u64 now)
 	// If this is not the case, it is most likely a flush request, which uses the elv.priv fields for flush data.
 	// Both structs are contained in the same union.
 	if (k2_rq_is_managed_by_k2(rq)) {
-		//printk(KERN_INFO "k2: Completed %s request %px for process with PID %d and request size %u, sectors %d, Real latency: %lld, estimated latency: %lld\n",
-		//      k2_req_type_names[k2_req_type(rq)] ,rq, k2_get_rq_pid(rq), (blk_rq_stats_sectors(rq) << SECTOR_SHIFT) >> 10 , blk_rq_stats_sectors(rq), real_latency, k2_get_rq_latency(rq));
+		K2_LOG(printk(KERN_INFO
+			      "k2: Completed %s request %px for process with PID %d and request size %u, sectors %d, Real latency: %lld, estimated latency: %lld\n",
+			      k2_req_type_names[k2_req_type(rq)], rq,
+			      k2_get_rq_pid(rq),
+			      (blk_rq_stats_sectors(rq) << SECTOR_SHIFT) >> 10,
+			      blk_rq_stats_sectors(rq), real_latency,
+			      k2_get_rq_latency(rq));)
 		k2_remove_latency(k2d, rq);
 		trace_k2_completed_request(rq, real_latency);
 
@@ -2260,7 +2278,7 @@ static void k2_completed_request(struct request *rq, u64 now)
 		K2_LOG(printk(KERN_INFO "k2: Rerun hardware queues\n"));
 		blk_mq_run_hw_queues(rq->q, true);
 	} else {
-		//printk(KERN_INFO "k2: Do not rerun hardware queues\n");
+		K2_LOG(printk(KERN_INFO "k2: Do not rerun hardware queues\n");)
 	}
 }
 
@@ -2333,7 +2351,8 @@ static void k2_depth_updated(struct blk_mq_hw_ctx *hctx)
 	unsigned int shift = tags->bitmap_tags->sb.shift;
 
 	k2d->async_depth = (1U << shift) * K2_ASYNC_PERCENTAGE / 100U;
-	//printk(KERN_ERR "k2: Set async depth to %u\n", k2d->async_depth);
+	K2_LOG(printk(KERN_INFO "k2: Set async depth to %u\n",
+		      k2d->async_depth);)
 
 	sbitmap_queue_min_shallow_depth(tags->bitmap_tags, k2d->async_depth);
 }
@@ -2357,7 +2376,8 @@ static void k2_limit_depth(unsigned int op, struct blk_mq_alloc_data *data)
 {
 	if (!op_is_sync(op)) {
 		struct k2_data *k2d = data->q->elevator->elevator_data;
-		//printk(KERN_ERR "k2: GET async depth to %u\n", k2d->async_depth);
+		K2_LOG(printk(KERN_INFO "k2: GET async depth of %u\n",
+			      k2d->async_depth);)
 
 		data->shallow_depth = k2d->async_depth;
 	}
