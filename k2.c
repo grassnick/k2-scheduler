@@ -36,9 +36,9 @@
 #include <linux/module.h>
 #include <linux/uaccess.h>
 
+// Tracing related
 #define CREATE_TRACE_POINTS
 
-// Tracing related
 #include "k2_trace.h"
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(k2_completed_request);
@@ -451,8 +451,6 @@ struct k2_dev {
 	struct list_head k2_instances;
 
 	spinlock_t lock;
-
-	// TODO: Add lock to cover race conditions
 };
 
 /**
@@ -1318,7 +1316,6 @@ static int k2_del_dynamic_rt_rq(struct k2_data *k2d, pid_t pid)
 	int error = 0;
 	unsigned long flags;
 
-	// TODO: Avoid busy waiting here?
 	spin_lock_irqsave(&k2d->lock, flags);
 
 	// Check if PID is already assigned
@@ -1356,7 +1353,6 @@ static int k2_del_all_dynamic_rt_rq(struct k2_data *k2d)
 	int error = 0;
 	unsigned long flags;
 
-	// TODO: Avoid busy waiting here?
 	spin_lock_irqsave(&k2d->lock, flags);
 
 	if (!list_empty(&k2d->rt_dynamic_rqs)) {
