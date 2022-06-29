@@ -650,7 +650,7 @@ static void k2_close_dev(struct k2_dev *device)
 	}
 	device = NULL;
 	k2_global_k2_dev = NULL;
-	printk(KERN_INFO "k2: Unregistered device node: /dev/%s",
+	printk(KERN_INFO "k2: Unregistered device node: /dev/%s\n",
 	       K2_DEVICE_NAME);
 }
 
@@ -665,7 +665,7 @@ static int k2_init_dev(void)
 	dev = kzalloc(sizeof(struct k2_dev), GFP_KERNEL);
 	if (NULL == dev) {
 		printk(KERN_ERR
-		       "k2: could not allocate device: device struct kzalloc() failed");
+		       "k2: could not allocate device: device struct kzalloc() failed\n");
 		return -ENOMEM;
 	}
 
@@ -673,7 +673,7 @@ static int k2_init_dev(void)
 				    K2_DEVICE_NAME);
 	if (error < 0) {
 		printk(KERN_ERR
-		       "k2: could not allocate device: alloc_chrdev_region() failed: %d",
+		       "k2: could not allocate device: alloc_chrdev_region() failed: %d\n",
 		       error);
 		goto abort;
 	}
@@ -686,19 +686,19 @@ static int k2_init_dev(void)
 	error = cdev_add(&dev->cdev, device_id, 1);
 	if (error) {
 		printk(KERN_ERR
-		       "k2: could not allocate device: cdev_add() failed");
+		       "k2: could not allocate device: cdev_add() failed\n");
 		goto abort;
 	}
 
 	printk(KERN_INFO
 	       "k2: Initialized device with Major device number: %d and "
-	       "Minor device number: %d",
+	       "Minor device number: %d\n",
 	       MAJOR(dev->cdev.dev), MINOR(dev->cdev.dev));
 
 	k2_class = class_create(THIS_MODULE, K2_DEVICE_NAME);
 	if (IS_ERR(k2_class)) {
 		printk(KERN_ERR
-		       "k2: could not allocate device: class_create() failed");
+		       "k2: could not allocate device: class_create() failed\n");
 		error = -EEXIST; // I do not know what else to put here :/
 		goto abort;
 	}
@@ -707,7 +707,7 @@ static int k2_init_dev(void)
 		device_create(k2_class, NULL, device_id, NULL, K2_DEVICE_NAME);
 	if (IS_ERR(k2_device)) {
 		printk(KERN_ERR
-		       "k2: could not allocate device: device_create() failed");
+		       "k2: could not allocate device: device_create() failed\n");
 		class_destroy(k2_class);
 		error = -EEXIST; // I do not know what else to put here :/
 		goto abort;
@@ -717,7 +717,7 @@ static int k2_init_dev(void)
 	dev->device = k2_device;
 
 	k2_global_k2_dev = dev;
-	printk(KERN_INFO "k2: Initialized device node: /dev/%s",
+	printk(KERN_INFO "k2: Initialized device node: /dev/%s\n",
 	       K2_DEVICE_NAME);
 
 	return 0;
@@ -940,7 +940,7 @@ static latency_ns_t k2_expected_request_latency(struct k2_data *k2d,
 	u64 bytes_diff = 0;
 
 	if (K2_REQ_OTHER == type) {
-		K2_LOG(printk(KERN_INFO "k2: Request is misc: %u",
+		K2_LOG(printk(KERN_INFO "k2: Request is misc: %u\n",
 			      rq->cmd_flags & REQ_OP_MASK));
 		goto end;
 	}
@@ -956,7 +956,7 @@ static latency_ns_t k2_expected_request_latency(struct k2_data *k2d,
 		      access_pattern == K2_REQ_RAND));
 #endif
 
-	K2_LOG(printk(KERN_INFO "k2: Request size: %u (%uk), type: %s", rq_size,
+	K2_LOG(printk(KERN_INFO "k2: Request size: %u (%uk), type: %s\n", rq_size,
 		      rq_size >> 10, k2_req_type_names[type]));
 
 	if (rq_size <= k2d->block_sizes[K2_REQ_512]) {
@@ -997,7 +997,7 @@ static latency_ns_t k2_expected_request_latency(struct k2_data *k2d,
 #endif
 
 end:
-	K2_LOG(printk(KERN_INFO "k2: Expected introduced latency: %lld",
+	K2_LOG(printk(KERN_INFO "k2: Expected introduced latency: %lld\n",
 		      rq_lat));
 	return rq_lat;
 
@@ -1084,7 +1084,7 @@ static inline void k2_add_latency(struct k2_data *k2d, struct request *rq)
 		ktime_add(k2d->current_inflight_latency, k2_get_rq_latency(rq));
 
 	K2_LOG(printk(KERN_DEBUG
-		      "k2: Added: current inflight %u, current_latency %lld",
+		      "k2: Added: current inflight %u, current_latency %lld\n",
 		      count, lat));
 
 	k2d->inflight = count;
@@ -1126,7 +1126,7 @@ static inline void k2_remove_latency(struct k2_data *k2d, struct request *rq)
 	}
 
 	K2_LOG(printk(KERN_DEBUG
-		      "k2: Removed: current inflight %u, current_latency %lld",
+		      "k2: Removed: current inflight %u, current_latency %lld\n",
 		      count, lat));
 
 	k2d->inflight = count;
@@ -1144,7 +1144,7 @@ static inline bool k2_does_request_fit(struct k2_data *k2d, struct request *rq)
 	if (k2d->inflight <= K2_MINIMUM_COHERENT_REQUEST_COUNT) {
 		K2_LOG(printk(
 			KERN_INFO
-			"k2: Queue length is lower than throttling threshold, request dispatch accepted!"));
+			"k2: Queue length is lower than throttling threshold, request dispatch accepted!\n"));
 		return true;
 	}
 
@@ -1160,9 +1160,9 @@ static inline bool k2_does_request_fit(struct k2_data *k2d, struct request *rq)
 	if (!does_fit) {
 		K2_LOG(printk(
 			KERN_INFO
-			"k2: Request dispatch rejected, queue limit would be exceeded!"));
+			"k2: Request dispatch rejected, queue limit would be exceeded!\n"));
 	} else {
-		K2_LOG(printk(KERN_INFO "k2: Request dispatch accepted!"));
+		K2_LOG(printk(KERN_INFO "k2: Request dispatch accepted!\n"));
 	}
 
 	return does_fit;
@@ -1181,7 +1181,7 @@ k2_does_request_fit_check_registered_queues(struct k2_data *k2d,
 		// Do not deadlock when request time exceeds maximum inflight latency
 		K2_LOG(printk(
 			KERN_INFO
-			"k2: Queue length is lower than throttling threshold, request dispatch accepted!"));
+			"k2: Queue length is lower than throttling threshold, request dispatch accepted!\n"));
 		return true;
 	}
 
@@ -1232,9 +1232,9 @@ regular_constraints:
 	if (!does_fit) {
 		K2_LOG(printk(
 			KERN_INFO
-			"k2: Request dispatch rejected, queue limit would be exceeded!"));
+			"k2: Request dispatch rejected, queue limit would be exceeded!\n"));
 	} else {
-		K2_LOG(printk(KERN_INFO "k2: Request dispatch accepted!"));
+		K2_LOG(printk(KERN_INFO "k2: Request dispatch accepted!\n"));
 	}
 
 	return does_fit;
@@ -1363,7 +1363,7 @@ static int k2_del_all_dynamic_rt_rq(struct k2_data *k2d)
 			//  Do nothing like in static queues? Are those lost?
 			//  What about the associated kernel memory buffer?
 			printk(KERN_INFO
-			       "k2: Deleting realtime request queue for pid %d on %s",
+			       "k2: Deleting realtime request queue for pid %d on %s\n",
 			       rqs->pid, k2d->rq->disk->disk_name);
 			list_del(list_elem);
 			kfree(rqs);
@@ -1525,7 +1525,7 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 			      &k2_global_k2_dev->k2_instances);
 	} else {
 		printk(KERN_WARNING
-		       "Could not register k2 scheduler instance for device /dev/%s for ioctl interaction",
+		       "Could not register k2 scheduler instance for device /dev/%s for ioctl interaction\n",
 		       k2d->rq->disk->disk_name);
 	}
 
@@ -1579,7 +1579,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx,
 	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
 	unsigned long flags;
-	K2_LOG(printk("k2: TRY Entering insert on pid %d", current->pid);)
+	K2_LOG(printk("k2: TRY Entering insert on pid %d\n", current->pid);)
 
 	spin_lock_irqsave(&k2d->lock, flags);
 
@@ -1593,7 +1593,7 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx,
 		struct k2_dynamic_rt_rq *rt_rqs;
 		ktime_t now;
 
-		K2_LOG(printk("k2: Entering insert on pid %d", current->pid);)
+		K2_LOG(printk("k2: Entering insert on pid %d\n", current->pid);)
 
 		rq = list_first_entry(rqs, struct request, queuelist);
 		list_del_init(&rq->queuelist);
@@ -1694,13 +1694,13 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx,
 		if (prio_class == IOPRIO_CLASS_RT) {
 			K2_LOG(printk(
 				KERN_INFO
-				"k2: Insert request %pK to static rt queue %d for pid %d \n",
+				"k2: Insert request %pK to static rt queue %d for pid %d\n",
 				rq, prio_value, pid));
 			k2_queue = &k2d->rt_reqs[prio_value];
 		} else {
 			K2_LOG(printk(
 				KERN_INFO
-				"k2: Insert request %pK to static be queue for pid %d \n",
+				"k2: Insert request %pK to static be queue for pid %d\n",
 				rq, pid));
 			k2_queue = &k2d->be_reqs;
 		}
@@ -2167,7 +2167,7 @@ static void k2_requests_merged(struct request_queue *q, struct request *rq,
 	struct k2_data *k2d = rq->q->elevator->elevator_data;
 	unsigned long flags;
 
-	K2_LOG(printk(KERN_INFO "k2: Entering k2_requests_merged"));
+	K2_LOG(printk(KERN_INFO "k2: Entering k2_requests_merged\n"));
 	if (!k2_rq_is_managed_by_k2(rq) || !k2_rq_is_managed_by_k2(next)) {
 		printk(KERN_ERR
 		       "k2: Merged 2 requests, where at least one was not managed by k2 before!\n");
