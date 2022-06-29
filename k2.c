@@ -880,7 +880,7 @@ static void k2_remove_request(struct request_queue *q, struct request *r)
  * @param upper_val The next higher value with a assocuated latency
  * @param lower_lat The latency associated with @param lower_val
  * @param upper_lat The latency associated with @param upper_val
- * @return The interpolated latency for the requestes value
+ * @return The interpolated latency for the request
  */
 static latency_ns_t k2_linear_interpolation(const u32 val, const u32 lower_val,
 					    const u32 upper_val,
