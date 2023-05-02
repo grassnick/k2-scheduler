@@ -1270,7 +1270,6 @@ static int k2_add_dynamic_rt_rq(struct k2_data *k2d, pid_t pid,
 		}
 	}
 
-	// TODO: Is this memory handling correct?
 	rq = kzalloc_node(sizeof(struct k2_dynamic_rt_rq), GFP_KERNEL,
 			  k2d->rq->node);
 	if (NULL == rq) {
@@ -1359,9 +1358,6 @@ static int k2_del_all_dynamic_rt_rq(struct k2_data *k2d)
 		list_for_each_safe (list_elem, tmp, &k2d->rt_dynamic_rqs) {
 			rqs = list_entry(list_elem, struct k2_dynamic_rt_rq,
 					 list);
-			// TODO: How to handle requests still in software queues?
-			//  Do nothing like in static queues? Are those lost?
-			//  What about the associated kernel memory buffer?
 			printk(KERN_INFO
 			       "k2: Deleting realtime request queue for pid %d on %s\n",
 			       rqs->pid, k2d->rq->disk->disk_name);
